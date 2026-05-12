@@ -1,61 +1,71 @@
-# HublinkGateway iOS
+# Voleo (iOS)
 
-A Bluetooth Low Energy (BLE) gateway application for iOS that enables communication with Hublink devices for file transfer and data management.
+Companion app for Juxta 5.8+ wearable devices. Connect over Bluetooth Low Energy, sync session settings, transfer daily data packages, and inspect logs — all from your iPhone.
+
+Developed by the [Neurotech Hub](https://neurotechhub.wustl.edu) at Washington University in St. Louis.
 
 ## Overview
 
-HublinkGateway is a developer-focused iOS app that replicates core functionality from a Raspberry Pi-based gateway system. It provides a clean, efficient interface for discovering, connecting to, and managing Hublink devices over BLE.
+Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes session settings (Subject ID, Experiment, advertising/scanning intervals, inactivity doubler), discovers the daily files on the device, and pulls them down as locally stored CSV "Daily Packages" you can browse, plot, share, and copy long after disconnecting.
 
 ## Features
 
-- **BLE Device Discovery** - Scan for Hublink devices using custom service UUID
-- **Device Connection** - Connect to discovered devices with automatic service discovery
-- **Manual Controls** - Send timestamp, request filenames, and clear device memory
-- **File Transfer** - Request and receive files from connected devices
-- **Real-time Terminal** - View all BLE communication with timestamps
-- **File Content Display** - Hex view of received file data with copy functionality
-- **Auto-cleanup** - Device list automatically clears after 30 seconds of inactivity
+- **BLE scan & connect** with custom service UUID
+- **Firmware gate** — disconnects from any device not reporting `firmware_version` starting with `5.8`
+- **Session settings sync** — Subject ID, Experiment, advertising interval, scanning interval, inactivity doubler; values are read from the node on connect and pushed back from the inline Device Settings card
+- **Daily Packages** — groups `JXV/JXS/JXB YYYYMMDD.csv` files for a day, transfers all three at once, and stores them under `Documents/<device_id>/`
+- **Packages tab** — browse all locally stored packages across all devices, plus per-package detail with raw text, **View Plots** (Vitals: battery / temperature / motion; BLE Activity: peer-vs-time scatter color-coded by RSSI), **View Table** (Settings), Copy All, and Share
+- **Terminal tab** — full BLE log with copy / clear
+- **Info tab** — app version, DFU note (uses Nordic **nRF Connect** with developer-supplied firmware), and magnet-gesture / LED reference
+- **Visual connection cue** — Device tab icon turns green while connected; battery glyph reflects the reported percent
 
 ## Requirements
 
 - iOS 17.0+
 - Xcode 15.0+
-- Bluetooth-enabled device
-- Hublink-compatible peripheral devices
+- A physical Bluetooth-enabled iPhone (BLE does not work in the Simulator)
+- A Juxta 5.8+ device
 
 ## Installation
 
-1. Clone the repository
-2. Open `HublinkGateway-iOS.xcodeproj` in Xcode
-3. Configure Bluetooth permissions in project settings
-4. Build and run on device (BLE requires physical device)
+1. Clone the repository.
+2. Open `Juxta-Voleo-iOS.xcodeproj` in Xcode.
+3. Confirm Bluetooth and Background Modes capabilities are configured for your team / signing setup.
+4. Build & run the **Voleo-iOS** scheme on a physical device.
 
 ## Usage
 
-### Scanning for Devices
-- Tap "Scan" to discover nearby Hublink devices
-- Devices are filtered by the Hublink service UUID
-- Scan automatically stops after 10 seconds
+### Scan & connect
 
-### Connecting to Devices
-- Tap "Connect" on any discovered device
-- App automatically discovers Hublink characteristics
-- Connection status is displayed in the header
+- Open the **Device** tab and tap **Scan** to discover Juxta devices (filtered by the service UUID below).
+- Tap **Connect** on a discovered device. After service discovery, Voleo validates firmware and reads the node payload (battery, memory, firmware version, subject, experiment, advertising/scanning intervals, inactivity doubler).
+- If firmware doesn't start with `5.8`, Voleo disconnects and shows an **Incompatible Voleo (v5.8) device** alert.
 
-### Manual Operations
-- **Timestamp** - Send current timestamp to device
-- **Get Files** - Request list of available files
-- **Clear Memory** - Clear device memory (requires double confirmation)
-- **Request File** - Enter filename and request file transfer
+### Device Settings (push)
 
-### File Management
-- Received file content is displayed as hexadecimal
-- Copy button to copy file content to clipboard
-- Clear button to clear the display area
+- Edit Subject ID, Experiment, advertising interval (1–10 s, step 1), scanning interval (5–60 s, step 5), and the inactivity doubler in the inline card.
+- **Push** writes the values to the device. **Default** asks for confirmation, then restores Adv `1 s`, Scan `20 s`, Inactivity doubler `on` locally (you still need to **Push** to send them).
+
+### Daily Packages
+
+- The connected screen lists daily packages found on the device. Pick a date and tap **Transfer Selected**; Voleo will queue Vitals, Settings, and BLE Activity in turn.
+- Transferred packages get a green checkmark for the duration of the session.
+- Files land in `Documents/<device_id>/` and remain available offline in the **Packages** tab.
+- In the Packages detail screen you can **Copy All** (filenames included in section headers), **Share** (via a temporary directory copy to satisfy iOS sandboxing), **View Plots**, or **View Table**.
+
+### Maintenance
+
+- **Shelf Mode** — sends `{"reset": true}` after a confirmation alert.
+- **Clear Memory** — sends `{"clear_memory": true}` after a confirmation alert.
+
+### Terminal
+
+The Terminal tab opens a full-screen sheet with the BLE log. Copy or clear from the toolbar.
 
 ## BLE Protocol
 
-The app communicates using custom Hublink UUIDs:
+The app communicates using these UUIDs:
+
 - Service: `57617368-5501-0001-8000-00805f9b34fb`
 - Filename: `57617368-5502-0001-8000-00805f9b34fb`
 - File Transfer: `57617368-5503-0001-8000-00805f9b34fb`
@@ -121,11 +131,24 @@ All gateway commands use **snake_case** keys, matching the node payload. Setting
 | `send_filenames`     | bool    | Asks the device to return its file listing.                                      |
 | `clear_memory`       | bool    | Wipes device storage; confirmed via UI alert.                                    |
 | `reset`              | bool    | "Shelf Mode" — gracefully reset the device.                                      |
-| `subject_id`         | string  | Always sent on Save; whitespace-trimmed.                                         |
+| `subject_id`         | string  | Always sent on Push; whitespace-trimmed.                                         |
 | `experiment`         | string  | Sent only when non-empty after trimming.                                         |
 | `adv_interval`       | int     | 1–10s, step 1.                                                                   |
 | `scan_interval`      | int     | 5–60s, step 5.                                                                   |
 | `inactivity_doubler` | bool    | Doubles intervals during periods of inactivity.                                  |
+
+### Daily Packages on disk
+
+Transferred files are stored at:
+
+```
+Documents/<device_id>/
+  JXV<YYYYMMDD>.csv   # Vitals
+  JXS<YYYYMMDD>.csv   # Settings
+  JXB<YYYYMMDD>.csv   # BLE Activity
+```
+
+The `<YYYYMMDD>` portion is the date key Voleo groups by.
 
 ### Schema sync checklist
 
@@ -136,9 +159,16 @@ If you change the JSON schema in either direction:
 3. Update `BLEManager.saveSettings()` / `clearMemory()` / `sendFilenamesRequest()` / `resetToShelfMode()` (gateway writes).
 4. Communicate the change to the firmware developer so the node side matches.
 
+## Firmware update (DFU)
+
+Voleo does not flash firmware. To update a device:
+
+1. Use the magnet gesture to enter DFU mode (see the **Info** tab in the app for the magnet/LED reference).
+2. Use Nordic Semiconductor's **nRF Connect** app to flash a firmware image supplied by the developer.
+
 ## Development
 
-This app is designed for developers working with Hublink devices. The terminal provides real-time feedback for debugging BLE communication, and the interface is optimized for development workflows.
+Voleo is intended for developers and operators working with Juxta 5.8+ devices. The Terminal tab provides full BLE-level visibility for debugging, and the Info tab surfaces the build number (`CFBundleShortVersionString` + `CFBundleVersion`) for support reports.
 
 ## License
 
