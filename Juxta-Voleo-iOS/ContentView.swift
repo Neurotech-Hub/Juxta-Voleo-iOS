@@ -154,7 +154,9 @@ class AppState: ObservableObject {
     func resetSettingsToDefaults() {
         advInterval = 1
         scanInterval = 20
-        inactivityDoubler = true
+        advOff = false
+        scanOff = false
+        inactivityMultiplier = 2
         log("Settings reset to defaults")
     }
     @Published var memoryLevel: Int? = nil
@@ -165,7 +167,54 @@ class AppState: ObservableObject {
     @Published var experiment: String = ""
     @Published var advInterval = 5
     @Published var scanInterval = 20
-    @Published var inactivityDoubler = false
+    @Published var advOff = false
+    @Published var scanOff = false
+    /// Multiplier applied to the scan interval during inactivity. Sent as `inactivity_multiplier`.
+    /// Valid options: 1, 2, 3, 4, 5 (1 = effectively disabled).
+    @Published var inactivityMultiplier = 1
+
+    /// Snapshot of settings as they exist on the connected device (after node read or successful Push).
+    /// Compared against the live values to detect unsaved edits.
+    private struct SettingsSnapshot: Equatable {
+        var subjectID: String
+        var experiment: String
+        var advInterval: Int
+        var scanInterval: Int
+        var advOff: Bool
+        var scanOff: Bool
+        var inactivityMultiplier: Int
+    }
+    @Published private var settingsBaseline: SettingsSnapshot? = nil
+
+    func captureSettingsBaseline() {
+        settingsBaseline = SettingsSnapshot(
+            subjectID: subjectID,
+            experiment: experiment,
+            advInterval: advInterval,
+            scanInterval: scanInterval,
+            advOff: advOff,
+            scanOff: scanOff,
+            inactivityMultiplier: inactivityMultiplier
+        )
+    }
+
+    func clearSettingsBaseline() {
+        settingsBaseline = nil
+    }
+
+    var hasUnsavedSettings: Bool {
+        guard let baseline = settingsBaseline else { return false }
+        let current = SettingsSnapshot(
+            subjectID: subjectID,
+            experiment: experiment,
+            advInterval: advInterval,
+            scanInterval: scanInterval,
+            advOff: advOff,
+            scanOff: scanOff,
+            inactivityMultiplier: inactivityMultiplier
+        )
+        return current != baseline
+    }
     
     private var clearDevicesTimer: Timer?
     private var clockTimer: Timer?
@@ -397,9 +446,9 @@ class BLEManager: NSObject, ObservableObject {
 
         var command: [String: Any] = [
             "subject_id": trimmedSubject,
-            "adv_interval": appState.advInterval,
-            "scan_interval": appState.scanInterval,
-            "inactivity_doubler": appState.inactivityDoubler
+            "adv_interval": appState.advOff ? 0 : appState.advInterval,
+            "scan_interval": appState.scanOff ? 0 : appState.scanInterval,
+            "inactivity_multiplier": max(1, min(5, appState.inactivityMultiplier))
         ]
 
         let trimmedExperiment = appState.experiment.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -413,6 +462,7 @@ class BLEManager: NSObject, ObservableObject {
                 connectedPeripheral?.writeValue(jsonData, for: characteristic, type: .withResponse)
                 appState.log("SENT: \(payload)")
                 appState.pushFeedback = "Pushed"
+                appState.captureSettingsBaseline()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak appState] in
                     appState?.pushFeedback = ""
                 }
@@ -581,6 +631,7 @@ extension BLEManager: CBCentralManagerDelegate {
         stagingContent = ""
         sessionHandshakeStarted = false
         appState.transferredDateKeys.removeAll()
+        appState.clearSettingsBaseline()
         connectedPeripheral = peripheral
         peripheral.delegate = self
         peripheral.discoverServices([HublinkUUIDs.service])
@@ -626,6 +677,7 @@ extension BLEManager: CBCentralManagerDelegate {
         appState.batteryLevel = nil
         appState.memoryLevel = nil
         appState.firmwareVersion = nil
+        appState.clearSettingsBaseline()
     }
 }
 
@@ -738,19 +790,29 @@ extension BLEManager: CBPeripheralDelegate {
 
                         if let advInterval = json["adv_interval"] as? Int {
                             DispatchQueue.main.async {
-                                self.appState.advInterval = max(1, min(10, advInterval))
+                                if advInterval <= 0 {
+                                    self.appState.advOff = true
+                                } else {
+                                    self.appState.advOff = false
+                                    self.appState.advInterval = max(1, min(10, advInterval))
+                                }
                             }
                         }
 
                         if let scanInterval = json["scan_interval"] as? Int {
                             DispatchQueue.main.async {
-                                self.appState.scanInterval = max(5, min(60, scanInterval))
+                                if scanInterval <= 0 {
+                                    self.appState.scanOff = true
+                                } else {
+                                    self.appState.scanOff = false
+                                    self.appState.scanInterval = max(5, min(60, scanInterval))
+                                }
                             }
                         }
 
-                        if let inactivityDoubler = json["inactivity_doubler"] as? Bool {
+                        if let multiplier = json["inactivity_multiplier"] as? Int {
                             DispatchQueue.main.async {
-                                self.appState.inactivityDoubler = inactivityDoubler
+                                self.appState.inactivityMultiplier = max(1, min(5, multiplier))
                             }
                         }
 
@@ -767,6 +829,11 @@ extension BLEManager: CBPeripheralDelegate {
                         }
 
                         if let firmware = firmware, firmware.hasPrefix("5.8") {
+                            // Capture the node's settings as the "clean" baseline after all
+                            // dispatched updates above have been applied.
+                            DispatchQueue.main.async {
+                                self.appState.captureSettingsBaseline()
+                            }
                             startSessionHandshake()
                         } else {
                             DispatchQueue.main.async {
@@ -965,23 +1032,37 @@ struct ContentView: View {
         }
     }
 
-    /// SwiftUI tab items ignore conditional `foregroundStyle` for the inactive tab; set the underlying `UITabBarItem` images instead.
+    /// SwiftUI tab items ignore conditional `foregroundStyle` for the inactive tab; set the underlying
+    /// `UITabBarItem` image and title attributes directly. Re-applied on tab changes because SwiftUI
+    /// may restore its own tab item rendering when switching tabs.
     private static func applyDeviceTabBarConnectedTint(isConnected: Bool) {
-        DispatchQueue.main.async {
-            guard let tabVC = findRootTabBarController(),
-                  let items = tabVC.tabBar.items,
-                  let deviceItem = items.first else { return }
-            let symbolName = "antenna.radiowaves.left.and.right"
-            let config = UIImage.SymbolConfiguration(pointSize: 20, weight: .regular)
-            guard let base = UIImage(systemName: symbolName, withConfiguration: config) else { return }
-            if isConnected {
-                let green = base.withTintColor(.systemGreen, renderingMode: .alwaysOriginal)
-                deviceItem.image = green
-                deviceItem.selectedImage = green
-            } else {
-                deviceItem.image = base.withRenderingMode(.alwaysTemplate)
-                deviceItem.selectedImage = nil
-            }
+        // Two passes: now and on the next runloop tick. SwiftUI sometimes overwrites
+        // the underlying UITabBarItem after a tab switch; the second pass wins.
+        DispatchQueue.main.async { apply(isConnected: isConnected) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { apply(isConnected: isConnected) }
+    }
+
+    private static func apply(isConnected: Bool) {
+        guard let tabVC = findRootTabBarController(),
+              let items = tabVC.tabBar.items,
+              let deviceItem = items.first else { return }
+        let symbolName = "antenna.radiowaves.left.and.right"
+        let config = UIImage.SymbolConfiguration(pointSize: 20, weight: .regular)
+        guard let base = UIImage(systemName: symbolName, withConfiguration: config) else { return }
+        if isConnected {
+            let green = base.withTintColor(.systemGreen, renderingMode: .alwaysOriginal)
+            deviceItem.image = green
+            deviceItem.selectedImage = green
+            let titleAttrs: [NSAttributedString.Key: Any] = [.foregroundColor: UIColor.systemGreen]
+            deviceItem.setTitleTextAttributes(titleAttrs, for: .normal)
+            deviceItem.setTitleTextAttributes(titleAttrs, for: .selected)
+            deviceItem.setTitleTextAttributes(titleAttrs, for: .highlighted)
+        } else {
+            deviceItem.image = base.withRenderingMode(.alwaysTemplate)
+            deviceItem.selectedImage = nil
+            deviceItem.setTitleTextAttributes(nil, for: .normal)
+            deviceItem.setTitleTextAttributes(nil, for: .selected)
+            deviceItem.setTitleTextAttributes(nil, for: .highlighted)
         }
     }
 
@@ -1271,7 +1352,7 @@ struct ContentView: View {
                 appState.resetSettingsToDefaults()
             }
         } message: {
-            Text("Advertising interval will be set to 1 s, scanning interval to 20 s, and double during inactivity will be turned on. Tap Push to send these values to the device.")
+            Text("Advertising interval will be set to 1 s, scanning interval to 20 s, and the inactivity scan multiplier to 2×. Tap Push to send these values to the device.")
         }
     }
 
@@ -1287,7 +1368,7 @@ struct ContentView: View {
                 Button(action: { appState.showDefaultSettingsAlert = true }) {
                     Text("Default")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.orange)
+                        .foregroundColor(Color(.systemGray))
                 }
                 .buttonStyle(.plain)
                 .padding(.trailing, 22)
@@ -1342,9 +1423,19 @@ struct ContentView: View {
                         appState.advInterval = max(1, min(10, rounded))
                     }
                 ), in: 1...10, step: 1)
-                Text("\(appState.advInterval)s")
+                .disabled(appState.advOff)
+                Text(appState.advOff ? "-" : "\(appState.advInterval)s")
                     .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(appState.advOff ? .secondary : .primary)
                     .frame(width: 32, alignment: .trailing)
+                HStack(spacing: 4) {
+                    Text("Off")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Toggle("", isOn: $appState.advOff)
+                        .labelsHidden()
+                        .scaleEffect(0.75)
+                }
             }
 
             HStack(spacing: 8) {
@@ -1359,25 +1450,46 @@ struct ContentView: View {
                         appState.scanInterval = max(5, min(60, rounded))
                     }
                 ), in: 5...60, step: 5)
-                Text("\(appState.scanInterval)s")
+                .disabled(appState.scanOff)
+                Text(appState.scanOff ? "-" : "\(appState.scanInterval)s")
                     .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(appState.scanOff ? .secondary : .primary)
                     .frame(width: 32, alignment: .trailing)
+                HStack(spacing: 4) {
+                    Text("Off")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Toggle("", isOn: $appState.scanOff)
+                        .labelsHidden()
+                        .scaleEffect(0.75)
+                }
             }
 
-            HStack(spacing: 8) {
-                Text("Inactivity ×2")
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Inactivity Scan Multiplier")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
-                Spacer()
-                Toggle("", isOn: $appState.inactivityDoubler)
-                    .labelsHidden()
-                    .scaleEffect(0.85)
+                Picker("Inactivity Scan Multiplier", selection: $appState.inactivityMultiplier) {
+                    ForEach(1...5, id: \.self) { value in
+                        Text("\(value)×").tag(value)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
             }
         }
         .padding(12)
         .background(Color(.systemGray6))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(appState.hasUnsavedSettings ? Color.blue : Color.clear, lineWidth: 2)
+        )
+        .shadow(color: appState.hasUnsavedSettings ? Color.blue.opacity(0.45) : .clear,
+                radius: appState.hasUnsavedSettings ? 8 : 0)
         .animation(.easeInOut(duration: 0.2), value: appState.pushFeedback)
+        .animation(.easeInOut(duration: 0.2), value: appState.hasUnsavedSettings)
     }
 
     // MARK: - Inline Daily Packages card

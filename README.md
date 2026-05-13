@@ -6,13 +6,13 @@ Developed by the [Neurotech Hub](https://neurotechhub.wustl.edu) at Washington U
 
 ## Overview
 
-Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes session settings (Subject ID, Experiment, advertising/scanning intervals, inactivity doubler), discovers the daily files on the device, and pulls them down as locally stored CSV "Daily Packages" you can browse, plot, share, and copy long after disconnecting.
+Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes session settings (Subject ID, Experiment, advertising/scanning intervals, inactivity scan multiplier), discovers the daily files on the device, and pulls them down as locally stored CSV "Daily Packages" you can browse, plot, share, and copy long after disconnecting.
 
 ## Features
 
 - **BLE scan & connect** with custom service UUID
 - **Firmware gate** — disconnects from any device not reporting `firmware_version` starting with `5.8`
-- **Session settings sync** — Subject ID, Experiment, advertising interval, scanning interval, inactivity doubler; values are read from the node on connect and pushed back from the inline Device Settings card
+- **Session settings sync** — Subject ID, Experiment, advertising interval, scanning interval, inactivity scan multiplier; values are read from the node on connect and pushed back from the inline Device Settings card
 - **Daily Packages** — groups `JXV/JXS/JXB YYYYMMDD.csv` files for a day, transfers all three at once, and stores them under `Documents/<device_id>/`
 - **Packages tab** — browse all locally stored packages across all devices, plus per-package detail with raw text, **View Plots** (Vitals: battery / temperature / motion; BLE Activity: peer-vs-time scatter color-coded by RSSI), **View Table** (Settings), Copy All, and Share
 - **Terminal tab** — full BLE log with copy / clear
@@ -38,13 +38,15 @@ Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes
 ### Scan & connect
 
 - Open the **Device** tab and tap **Scan** to discover Juxta devices (filtered by the service UUID below).
-- Tap **Connect** on a discovered device. After service discovery, Voleo validates firmware and reads the node payload (battery, memory, firmware version, subject, experiment, advertising/scanning intervals, inactivity doubler).
+- Tap **Connect** on a discovered device. After service discovery, Voleo validates firmware and reads the node payload (battery, memory, firmware version, subject, experiment, advertising/scanning intervals, inactivity scan multiplier).
 - If firmware doesn't start with `5.8`, Voleo disconnects and shows an **Incompatible Voleo (v5.8) device** alert.
 
 ### Device Settings (push)
 
-- Edit Subject ID, Experiment, advertising interval (1–10 s, step 1), scanning interval (5–60 s, step 5), and the inactivity doubler in the inline card.
-- **Push** writes the values to the device. **Default** asks for confirmation, then restores Adv `1 s`, Scan `20 s`, Inactivity doubler `on` locally (you still need to **Push** to send them).
+- Edit Subject ID, Experiment, advertising interval (1–10 s, step 1), scanning interval (5–60 s, step 5), and the inactivity scan multiplier in the inline card.
+- Each interval has an **Off** toggle to the right of its slider; turning it on disables the slider and sends `0` for that interval (advertising or scanning disabled on the node).
+- The inactivity scan multiplier is a segmented control with `1×…5×`; the selected integer is sent as `inactivity_multiplier` and is applied to the scan interval during inactivity (`1×` effectively disables the multiplier).
+- **Push** writes the values to the device. **Default** asks for confirmation, then restores Adv `1 s`, Scan `20 s`, Inactivity Scan Multiplier `2×`, and clears both **Off** toggles locally (you still need to **Push** to send them).
 
 ### Daily Packages
 
@@ -90,7 +92,7 @@ On connect the app reads the node characteristic and expects a JSON object with 
   "subject_id": "<from NVS>",
   "adv_interval": 5,
   "scan_interval": 20,
-  "inactivity_doubler": false
+  "inactivity_multiplier": 2
 }
 ```
 
@@ -102,9 +104,9 @@ On connect the app reads the node characteristic and expects a JSON object with 
 | `device_id`          | string  | Used as the device folder name for stored packages and logged on connect.    |
 | `subject_id`         | string  | Populates the Subject ID field in Settings.                                  |
 | `experiment`         | string  | Populates the Experiment field in Settings.                                  |
-| `adv_interval`       | int     | Populates the Advertising Interval slider (clamped 1–10s).                   |
-| `scan_interval`      | int     | Populates the Scanning Interval slider (clamped 5–60s, step 5).              |
-| `inactivity_doubler` | bool    | Populates the "Double during inactivity" toggle.                             |
+| `adv_interval`       | int     | Populates the Advertising Interval slider (clamped 1–10s). `0` flips the row's **Off** toggle on and disables the slider. |
+| `scan_interval`      | int     | Populates the Scanning Interval slider (clamped 5–60s, step 5). `0` flips the row's **Off** toggle on and disables the slider. |
+| `inactivity_multiplier` | int  | Populates the "Inactivity Scan Multiplier" segmented control (clamped 1–5). |
 | other keys           | any     | Ignored.                                                                     |
 
 ### Gateway Characteristic Payload (WRITE)
@@ -121,7 +123,7 @@ All gateway commands use **snake_case** keys, matching the node payload. Setting
   "experiment": "trial-A",
   "adv_interval": 5,
   "scan_interval": 20,
-  "inactivity_doubler": false
+  "inactivity_multiplier": 2
 }
 ```
 
@@ -133,9 +135,9 @@ All gateway commands use **snake_case** keys, matching the node payload. Setting
 | `reset`              | bool    | "Shelf Mode" — gracefully reset the device.                                      |
 | `subject_id`         | string  | Always sent on Push; whitespace-trimmed.                                         |
 | `experiment`         | string  | Sent only when non-empty after trimming.                                         |
-| `adv_interval`       | int     | 1–10s, step 1.                                                                   |
-| `scan_interval`      | int     | 5–60s, step 5.                                                                   |
-| `inactivity_doubler` | bool    | Doubles intervals during periods of inactivity.                                  |
+| `adv_interval`       | int     | 1–10s, step 1. Sent as `0` when the row's **Off** toggle is on (advertising disabled). |
+| `scan_interval`      | int     | 5–60s, step 5. Sent as `0` when the row's **Off** toggle is on (scanning disabled).    |
+| `inactivity_multiplier` | int  | Multiplier applied to the scan interval during inactivity. Integer in `1…5` (1 = effectively off, 2 = doubled, etc.). |
 
 ### Daily Packages on disk
 
