@@ -37,6 +37,38 @@ struct DailyPackage: Identifiable {
     let dateKey: String      // e.g. "20260507"
     let deviceID: String     // e.g. "JX_XXXXXX"
     var files: [String: URL] // filename -> local URL
+    /// Latest `contentModificationDate` among local CSVs; used for ordering because `dateKey` is day-only.
+    let lastFileWriteAt: Date
+
+    init(dateKey: String, deviceID: String, files: [String: URL] = [:], lastFileWriteAt: Date = .distantPast) {
+        self.dateKey = dateKey
+        self.deviceID = deviceID
+        self.files = files
+        self.lastFileWriteAt = lastFileWriteAt
+    }
+
+    /// Strongest signal for “most recently transferred” on this device; falls back to local noon on `dateKey` when mtimes are unavailable (e.g. in-memory listing paths).
+    static func resolvedLastFileWriteAt(files: [String: URL], dateKey: String) -> Date {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey]
+        var best = Date.distantPast
+        for (_, url) in files {
+            guard let vals = try? url.resourceValues(forKeys: keys),
+                  let d = vals.contentModificationDate else { continue }
+            if d > best { best = d }
+        }
+        if best > .distantPast { return best }
+        return noonOnDateKey(dateKey) ?? .distantPast
+    }
+
+    private static func noonOnDateKey(_ key: String) -> Date? {
+        guard key.count == 8, key.allSatisfy({ $0.isNumber }) else { return nil }
+        guard let y = Int(key.prefix(4)),
+              let m = Int(key.dropFirst(4).prefix(2)),
+              let d = Int(key.suffix(2)) else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        return cal.date(from: DateComponents(year: y, month: m, day: d, hour: 12, minute: 0, second: 0))
+    }
 
     var displayDate: String {
         let inputFormatter = DateFormatter()
@@ -90,8 +122,17 @@ class PackageStore: ObservableObject {
             }
 
             var result: [DailyPackage] = []
-            for (_, dateMap) in deviceMap { result.append(contentsOf: dateMap.values) }
-            result.sort { ($0.deviceID + $0.dateKey) > ($1.deviceID + $1.dateKey) }
+            for (deviceID, dateMap) in deviceMap {
+                for (key, pkg) in dateMap {
+                    let writeAt = DailyPackage.resolvedLastFileWriteAt(files: pkg.files, dateKey: key)
+                    result.append(DailyPackage(dateKey: key, deviceID: deviceID, files: pkg.files, lastFileWriteAt: writeAt))
+                }
+            }
+            result.sort {
+                if $0.lastFileWriteAt != $1.lastFileWriteAt { return $0.lastFileWriteAt > $1.lastFileWriteAt }
+                if $0.dateKey != $1.dateKey { return $0.dateKey > $1.dateKey }
+                return $0.deviceID > $1.deviceID
+            }
 
             DispatchQueue.main.async { self.packages = result }
         }
@@ -770,7 +811,19 @@ extension BLEManager: CBPeripheralDelegate {
             }
             packageMap[key]!.files[name] = URL(fileURLWithPath: name)
         }
-        let packages = packageMap.values.sorted { $0.dateKey > $1.dateKey }
+        let packages = packageMap.values
+            .map { pkg in
+                DailyPackage(
+                    dateKey: pkg.dateKey,
+                    deviceID: pkg.deviceID,
+                    files: pkg.files,
+                    lastFileWriteAt: DailyPackage.resolvedLastFileWriteAt(files: pkg.files, dateKey: pkg.dateKey)
+                )
+            }
+            .sorted {
+                if $0.lastFileWriteAt != $1.lastFileWriteAt { return $0.lastFileWriteAt > $1.lastFileWriteAt }
+                return $0.dateKey > $1.dateKey
+            }
 
         DispatchQueue.main.async {
             self.appState.availablePackages = packages
@@ -1763,10 +1816,39 @@ struct ContentView: View {
 }
 
 // MARK: - Packages View
+private struct DevicePackageGroup: Identifiable {
+    let id: String
+    let deviceID: String
+    /// Newest first within the device.
+    let packages: [DailyPackage]
+}
+
 struct PackagesView: View {
     @EnvironmentObject var packageStore: PackageStore
     @State private var showDeleteConfirm = false
     @State private var packageToDelete: DailyPackage?
+
+    /// Devices ordered by most recently written local package (`lastFileWriteAt`); `dateKey` alone is day-only.
+    private var devicePackageGroups: [DevicePackageGroup] {
+        let byDevice = Dictionary(grouping: packageStore.packages, by: { $0.deviceID })
+        return byDevice
+            .map { deviceID, pkgs -> DevicePackageGroup in
+                let sorted = pkgs.sorted {
+                    if $0.lastFileWriteAt != $1.lastFileWriteAt { return $0.lastFileWriteAt > $1.lastFileWriteAt }
+                    return $0.dateKey > $1.dateKey
+                }
+                return DevicePackageGroup(id: deviceID, deviceID: deviceID, packages: sorted)
+            }
+            .sorted { a, b in
+                let newestA = a.packages.first?.lastFileWriteAt ?? .distantPast
+                let newestB = b.packages.first?.lastFileWriteAt ?? .distantPast
+                if newestA != newestB { return newestA > newestB }
+                let keyA = a.packages.first?.dateKey ?? ""
+                let keyB = b.packages.first?.dateKey ?? ""
+                if keyA != keyB { return keyA > keyB }
+                return a.deviceID < b.deviceID
+            }
+    }
 
     var body: some View {
         Group {
@@ -1785,41 +1867,44 @@ struct PackagesView: View {
                 }
             } else {
                 List {
-                    ForEach(packageStore.packages) { pkg in
-                        NavigationLink(destination: DailyPackageView(package: pkg)) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(pkg.displayDate)
-                                    .font(.system(size: 16, weight: .semibold))
-                                HStack(spacing: 8) {
-                                    Text(pkg.deviceID)
-                                        .font(.system(size: 12, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    HStack(spacing: 4) {
-                                        fileIcon("V", present: pkg.vitalsURL != nil)
-                                        fileIcon("S", present: pkg.settingsURL != nil)
-                                        fileIcon("B", present: pkg.bleURL != nil)
+                    ForEach(devicePackageGroups) { group in
+                        Section {
+                            ForEach(group.packages) { pkg in
+                                NavigationLink(destination: DailyPackageView(package: pkg)) {
+                                    HStack(alignment: .center, spacing: 10) {
+                                        Text(pkg.displayDate)
+                                            .font(.system(size: 15, weight: .semibold))
+                                            .lineLimit(1)
+                                            .minimumScaleFactor(0.8)
+                                        Spacer(minLength: 8)
+                                        HStack(spacing: 3) {
+                                            fileIcon("V", present: pkg.vitalsURL != nil)
+                                            fileIcon("S", present: pkg.settingsURL != nil)
+                                            fileIcon("B", present: pkg.bleURL != nil)
+                                        }
+                                        Image(systemName: pkg.isComplete ? "checkmark.circle.fill" : "exclamationmark.circle")
+                                            .foregroundColor(pkg.isComplete ? .green : .orange)
+                                            .font(.system(size: 14))
+                                            .imageScale(.small)
                                     }
-                                    if pkg.isComplete {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundColor(.green)
-                                            .font(.system(size: 12))
-                                    } else {
-                                        Image(systemName: "exclamationmark.circle")
-                                            .foregroundColor(.orange)
-                                            .font(.system(size: 12))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) {
+                                        packageToDelete = pkg
+                                        showDeleteConfirm = true
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
                                     }
                                 }
+                                .listRowInsets(EdgeInsets(top: 3, leading: 16, bottom: 3, trailing: 8))
                             }
-                            .padding(.vertical, 4)
-                        }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            Button(role: .destructive) {
-                                packageToDelete = pkg
-                                showDeleteConfirm = true
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
+                        } header: {
+                            Text(group.deviceID)
+                                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                .textCase(nil)
+                                .foregroundColor(.secondary)
                         }
                     }
                 }
@@ -1846,12 +1931,12 @@ struct PackagesView: View {
 
     private func fileIcon(_ letter: String, present: Bool) -> some View {
         Text(letter)
-            .font(.system(size: 10, weight: .bold, design: .monospaced))
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
             .background(present ? Color.blue.opacity(0.15) : Color(.systemGray5))
             .foregroundColor(present ? .blue : .secondary)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .clipShape(RoundedRectangle(cornerRadius: 3))
     }
 }
 
@@ -1906,7 +1991,7 @@ struct DailyPackageView: View {
                         case .plots(let kind):
                             PlotsView(csvText: text, kind: kind, displayDate: package.displayDate)
                         case .table:
-                            TableView(csvText: text, filename: filename, displayDate: package.displayDate)
+                            CSVFullTextView(csvText: text, filename: filename, displayDate: package.displayDate)
                         }
                     } label: {
                         HStack(spacing: 4) {
@@ -1962,9 +2047,9 @@ struct DailyPackageView: View {
 
     private func loadFiles() {
         Task { @MainActor in
-            vitalsContent = package.vitalsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
-            settingsContent = package.settingsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
-            bleContent = package.bleURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
+            vitalsContent = package.vitalsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(stripUTF8BOMPrefix(from:)) ?? ""
+            settingsContent = package.settingsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(stripUTF8BOMPrefix(from:)) ?? ""
+            bleContent = package.bleURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(stripUTF8BOMPrefix(from:)) ?? ""
         }
     }
 
@@ -2008,50 +2093,99 @@ enum SectionAction {
     var iconName: String {
         switch self {
         case .plots: return "chart.xyaxis.line"
-        case .table: return "tablecells"
+        case .table: return "doc.plaintext"
         }
     }
 
     var linkLabel: String {
         switch self {
         case .plots: return "View Plots"
-        case .table: return "View Table"
+        case .table: return "View All"
         }
     }
 }
 
 struct VitalsRow: Identifiable {
-    let id = UUID()
+    let id: Int
     let date: Date
     let battV: Double?
     let tempC: Double?
+    let lux: Double?
     let motion: Double?
 }
 
 struct BLERow: Identifiable {
-    let id = UUID()
+    let id: Int
     let date: Date
     let peerID: String
     let rssi: Int
 }
 
+private extension CharacterSet {
+    /// Whitespace/newlines plus BOM, ZWSP, NBSP (common in exports / SD tools).
+    static let csvCellTrimming = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: "\u{FEFF}\u{200B}\u{00A0}\u{202F}"))
+}
+
+/// SD card / PC exports often start with UTF-8 BOM (`U+FEFF`), which breaks keyed lookups for `unix`, etc.
+private func stripUTF8BOMPrefix(from text: String) -> String {
+    if text.hasPrefix("\u{FEFF}") {
+        var t = text
+        t.removeFirst()
+        return t
+    }
+    return text
+}
+
+private func normalizeCsvLineEndings(_ text: String) -> String {
+    text.replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+}
+
+private func trimCsvCell(_ raw: Substring) -> String {
+    var s = String(raw).trimmingCharacters(in: .csvCellTrimming)
+    while let c = s.first, c == "\u{FEFF}" || c == "\u{200B}" {
+        s.removeFirst()
+    }
+    return s
+}
+
+private func parseCsvUnixSeconds(_ raw: String?) -> TimeInterval? {
+    guard let s = raw?.trimmingCharacters(in: .csvCellTrimming), !s.isEmpty else { return nil }
+    return Double(s)
+}
+
+private func parseCsvDouble(_ raw: String?) -> Double? {
+    guard var s = raw?.trimmingCharacters(in: .csvCellTrimming), !s.isEmpty else { return nil }
+    if s.contains(","), !s.contains(".") { s = s.replacingOccurrences(of: ",", with: ".") }
+    return Double(s)
+}
+
+private func parseCsvInt(_ raw: String?) -> Int? {
+    guard let s = raw?.trimmingCharacters(in: .csvCellTrimming), !s.isEmpty else { return nil }
+    if let i = Int(s) { return i }
+    if let d = Double(s) { return Int(d.rounded()) }
+    return nil
+}
+
 private func parseCSV(_ text: String) -> [[String: String]] {
-    let lines = text
-        .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-        .map(String.init)
+    let normalized = normalizeCsvLineEndings(stripUTF8BOMPrefix(from: text))
+    let lines = normalized
+        .components(separatedBy: "\n")
+        .map { $0.trimmingCharacters(in: .csvCellTrimming) }
         .filter { !$0.isEmpty }
     guard let headerLine = lines.first else { return [] }
     let headers = headerLine
         .split(separator: ",", omittingEmptySubsequences: false)
-        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .map { trimCsvCell($0).lowercased() }
     var rows: [[String: String]] = []
     rows.reserveCapacity(max(0, lines.count - 1))
     for line in lines.dropFirst() {
         let cols = line
             .split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map(trimCsvCell)
         var dict: [String: String] = [:]
-        for (i, header) in headers.enumerated() where i < cols.count {
+        for (i, header) in headers.enumerated() where i < cols.count && !header.isEmpty {
             dict[header] = cols[i]
         }
         rows.append(dict)
@@ -2111,32 +2245,52 @@ struct PlotsView: View {
     @ViewBuilder
     private var vitalsCharts: some View {
         chartCard(title: "Battery Voltage (V)") {
-            Chart(vitalsRows) { row in
-                if let v = row.battV {
-                    LineMark(
-                        x: .value("Time", row.date),
-                        y: .value("Voltage", v)
-                    )
+            Chart {
+                ForEach(vitalsRows) { row in
+                    if let v = row.battV {
+                        LineMark(
+                            x: .value("Time", row.date),
+                            y: .value("Voltage", v)
+                        )
+                    }
                 }
             }
         }
         chartCard(title: "Temperature (°C)") {
-            Chart(vitalsRows) { row in
-                if let t = row.tempC {
-                    LineMark(
-                        x: .value("Time", row.date),
-                        y: .value("Temp", t)
-                    )
+            Chart {
+                ForEach(vitalsRows) { row in
+                    if let t = row.tempC {
+                        LineMark(
+                            x: .value("Time", row.date),
+                            y: .value("Temp", t)
+                        )
+                    }
+                }
+            }
+        }
+        if vitalsRows.contains(where: { $0.lux != nil }) {
+            chartCard(title: "Lux") {
+                Chart {
+                    ForEach(vitalsRows) { row in
+                        if let lux = row.lux {
+                            LineMark(
+                                x: .value("Time", row.date),
+                                y: .value("Lux", lux)
+                            )
+                        }
+                    }
                 }
             }
         }
         chartCard(title: "Motion (Count)") {
-            Chart(vitalsRows) { row in
-                if let m = row.motion {
-                    LineMark(
-                        x: .value("Time", row.date),
-                        y: .value("Motion", m)
-                    )
+            Chart {
+                ForEach(vitalsRows) { row in
+                    if let m = row.motion {
+                        LineMark(
+                            x: .value("Time", row.date),
+                            y: .value("Motion", m)
+                        )
+                    }
                 }
             }
         }
@@ -2145,13 +2299,15 @@ struct PlotsView: View {
     @ViewBuilder
     private var bleSection: some View {
         chartCard(title: "BLE Peers Over Time") {
-            Chart(bleRows) { row in
-                PointMark(
-                    x: .value("Time", row.date),
-                    y: .value("Peer", row.peerID)
-                )
-                .foregroundStyle(Self.rssiColor(row.rssi))
-                .symbolSize(40)
+            Chart {
+                ForEach(bleRows) { row in
+                    PointMark(
+                        x: .value("Time", row.date),
+                        y: .value("Peer", row.peerID)
+                    )
+                    .foregroundStyle(Self.rssiColor(row.rssi))
+                    .symbolSize(40)
+                }
             }
         }
         VStack(alignment: .leading, spacing: 6) {
@@ -2205,148 +2361,80 @@ struct PlotsView: View {
             errorText = nil
             switch k {
             case .vitals:
-                vitalsRows = rows.compactMap { row in
-                    guard let unix = row["unix"].flatMap(TimeInterval.init) else { return nil }
-                    return VitalsRow(
-                        date: Date(timeIntervalSince1970: unix),
-                        battV: row["batt_v"].flatMap(Double.init),
-                        tempC: row["temp_c"].flatMap(Double.init),
-                        motion: row["motion"].flatMap(Double.init)
+                var vs: [VitalsRow] = []
+                vs.reserveCapacity(rows.count)
+                for row in rows {
+                    guard let unix = parseCsvUnixSeconds(row["unix"]) else { continue }
+                    vs.append(
+                        VitalsRow(
+                            id: vs.count,
+                            date: Date(timeIntervalSince1970: unix),
+                            battV: parseCsvDouble(row["batt_v"]),
+                            tempC: parseCsvDouble(row["temp_c"]),
+                            lux: parseCsvDouble(row["lux"]),
+                            motion: parseCsvDouble(row["motion"])
+                        )
                     )
                 }
+                vitalsRows = vs
             case .ble:
-                bleRows = rows.compactMap { row in
-                    guard let unix = row["unix"].flatMap(TimeInterval.init),
-                          let peer = row["peer_id"], !peer.isEmpty,
-                          let rssi = row["rssi"].flatMap(Int.init) else { return nil }
-                    return BLERow(
-                        date: Date(timeIntervalSince1970: unix),
-                        peerID: peer,
-                        rssi: rssi
+                var br: [BLERow] = []
+                br.reserveCapacity(rows.count)
+                for row in rows {
+                    guard let unix = parseCsvUnixSeconds(row["unix"]) else { continue }
+                    let peer = (row["peer_id"] ?? row["observer_id"] ?? "").trimmingCharacters(in: .csvCellTrimming)
+                    guard !peer.isEmpty, let rssi = parseCsvInt(row["rssi"]) else { continue }
+                    br.append(
+                        BLERow(
+                            id: br.count,
+                            date: Date(timeIntervalSince1970: unix),
+                            peerID: peer,
+                            rssi: rssi
+                        )
                     )
                 }
+                bleRows = br
             }
         }
     }
 }
 
-// MARK: - Table View
+// MARK: - CSV full text (Settings “View All”)
 
-struct TableView: View {
-    /// In-memory CSV from `DailyPackageView` (no second file read).
+private struct CSVFullTextView: View {
+    /// In-memory CSV from `DailyPackageView` (same string as the package preview).
     let csvText: String
     let filename: String
     let displayDate: String
 
-    @State private var headers: [String] = []
-    @State private var rows: [[String]] = []
-    @State private var loaded = false
-
-    /// Column sizing — narrow enough to fit several columns on screen, wide enough that
-    /// most short values don't truncate. Header cells wrap to multiple lines as needed.
-    private let columnMinWidth: CGFloat = 90
-    private let columnMaxWidth: CGFloat = 220
+    private var lineCount: Int {
+        csvText.components(separatedBy: "\n").count
+    }
 
     var body: some View {
-        Group {
-            if !loaded {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if headers.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "tablecells.badge.ellipsis")
-                        .font(.system(size: 32))
-                        .foregroundColor(.secondary)
-                    Text("No table data")
-                        .font(.system(size: 14))
-                        .foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.vertical, showsIndicators: true) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(csvText.isEmpty ? "(empty)" : csvText)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.primary)
+                        .textSelection(.enabled)
+                        .padding(10)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                tableScroll
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemGray6))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            Text("\(filename) — \(lineCount) lines")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
         }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(.systemBackground))
         .navigationTitle("\(filename) — \(displayDate)")
         .navigationBarTitleDisplayMode(.inline)
-        .task { await load() }
-    }
-
-    private var tableScroll: some View {
-        ScrollView([.horizontal, .vertical], showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 0) {
-                headerRow
-                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                    dataRow(row, index: index)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-        }
-        .background(Color(.systemBackground))
-    }
-
-    private var headerRow: some View {
-        HStack(spacing: 0) {
-            ForEach(Array(headers.enumerated()), id: \.offset) { _, h in
-                Text(h)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.primary)
-                    .multilineTextAlignment(.leading)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(minWidth: columnMinWidth, maxWidth: columnMaxWidth, alignment: .leading)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 6)
-                    .background(Color(.systemGray5))
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .padding(.bottom, 2)
-    }
-
-    private func dataRow(_ row: [String], index: Int) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(headers.enumerated()), id: \.offset) { col, _ in
-                Text(col < row.count ? row[col] : "")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.primary)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .frame(minWidth: columnMinWidth, maxWidth: columnMaxWidth, alignment: .leading)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 4)
-            }
-        }
-        .background(index % 2 == 0 ? Color.clear : Color(.systemGray6).opacity(0.5))
-        .textSelection(.enabled)
-    }
-
-    private func load() async {
-        let text = csvText
-        let parsed: ([String], [[String]]) = await Task.detached(priority: .userInitiated) {
-            let lines = text
-                .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-                .map(String.init)
-                .filter { !$0.isEmpty }
-            guard let headerLine = lines.first else { return ([], []) }
-            let hdrs = headerLine
-                .split(separator: ",", omittingEmptySubsequences: false)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            var rs: [[String]] = []
-            rs.reserveCapacity(max(0, lines.count - 1))
-            for line in lines.dropFirst() {
-                let cols = line
-                    .split(separator: ",", omittingEmptySubsequences: false)
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                rs.append(cols)
-            }
-            return (hdrs, rs)
-        }.value
-        await MainActor.run {
-            headers = parsed.0
-            rows = parsed.1
-            loaded = true
-        }
     }
 }
 
