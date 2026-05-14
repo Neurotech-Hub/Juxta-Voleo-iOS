@@ -150,13 +150,42 @@ class AppState: ObservableObject {
     @Published var batteryLevel: Int? = nil
     @Published var transferredDateKeys: Set<String> = []
     @Published var pushFeedback: String = ""
+    @Published var showShelfDisconnectOverlay = false
+    /// True only after the node JSON includes every field required for the Device Settings card.
+    @Published var hasFullNodeDeviceSettings = false
+    /// 5.8 node without full device-settings fields (e.g. base station) — hide Device Settings and show a banner instead.
+    @Published var isBaseStationConnection = false
+
+    private var shelfDisconnectTimeoutWorkItem: DispatchWorkItem?
+    fileprivate var didLogBaseStationNotice = false
+
+    /// After "Reset to Shelf Mode", the node disconnects shortly; mask the stale connected UI until `didDisconnect` or timeout.
+    func beginShelfDisconnectAwait() {
+        shelfDisconnectTimeoutWorkItem?.cancel()
+        showShelfDisconnectOverlay = true
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.showShelfDisconnectOverlay {
+                self.showShelfDisconnectOverlay = false
+                self.log("WARN: Shelf mode — no disconnect within 10s; dismissed overlay")
+            }
+        }
+        shelfDisconnectTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    func endShelfDisconnectAwait() {
+        shelfDisconnectTimeoutWorkItem?.cancel()
+        shelfDisconnectTimeoutWorkItem = nil
+        showShelfDisconnectOverlay = false
+    }
 
     func resetSettingsToDefaults() {
-        advInterval = 1
-        scanInterval = 20
+        advInterval = 10
+        scanInterval = 10
         advOff = false
         scanOff = false
-        inactivityMultiplier = 2
+        inactivityMultiplier = 5
         log("Settings reset to defaults")
     }
     @Published var memoryLevel: Int? = nil
@@ -165,13 +194,13 @@ class AppState: ObservableObject {
     // Session settings (populated from node on connect)
     @Published var subjectID: String = ""
     @Published var experiment: String = ""
-    @Published var advInterval = 5
-    @Published var scanInterval = 20
+    @Published var advInterval = 10
+    @Published var scanInterval = 10
     @Published var advOff = false
     @Published var scanOff = false
-    /// Multiplier applied to the scan interval during inactivity. Sent as `inactivity_multiplier`.
+    /// Multiplier applied to the scan interval during inactivity. Sent on the gateway as `inactivityMultiplier`.
     /// Valid options: 1, 2, 3, 4, 5 (1 = effectively disabled).
-    @Published var inactivityMultiplier = 1
+    @Published var inactivityMultiplier = 5
 
     /// Snapshot of settings as they exist on the connected device (after node read or successful Push).
     /// Compared against the live values to detect unsaved edits.
@@ -200,6 +229,22 @@ class AppState: ObservableObject {
 
     func clearSettingsBaseline() {
         settingsBaseline = nil
+    }
+
+    func resetNodeDeviceSettingsAvailability() {
+        hasFullNodeDeviceSettings = false
+        isBaseStationConnection = false
+        didLogBaseStationNotice = false
+    }
+
+    /// Device Settings UI requires these camelCase keys (with matching types) in the node characteristic JSON.
+    fileprivate static func nodePayloadHasAllDeviceSettingsFields(_ json: [String: Any]) -> Bool {
+        guard json["subjectId"] as? String != nil else { return false }
+        guard json["experiment"] as? String != nil else { return false }
+        guard json["advInterval"] as? Int != nil else { return false }
+        guard json["scanInterval"] as? Int != nil else { return false }
+        guard json["inactivityMultiplier"] as? Int != nil else { return false }
+        return true
     }
 
     var hasUnsavedSettings: Bool {
@@ -300,6 +345,8 @@ class BLEManager: NSObject, ObservableObject {
     private var currentTransferDateKey = ""
     private var stagingContent = ""
     private var sessionHandshakeStarted = false
+    /// Accumulates filename-characteristic indications until listing is complete (`EOF` / full `…;EOF` frame).
+    private var filenameListingBuffer = ""
 
     init(appState: AppState, packageStore: PackageStore) {
         self.appState = appState
@@ -355,69 +402,57 @@ class BLEManager: NSObject, ObservableObject {
         }
     }
     
-    func sendTimestamp() {
+    @discardableResult
+    private func writeGatewayJSONObject(_ object: [String: Any]) -> Bool {
         guard let characteristic = gatewayCharacteristic else {
             appState.log("ERROR: Gateway characteristic not available")
-            return
+            return false
         }
-        
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let payload = "{\"timestamp\": \(timestamp)}"
-        
-        if let data = payload.data(using: .utf8) {
-            connectedPeripheral?.writeValue(data, for: characteristic, type: .withResponse)
-            appState.log("SENT: \(payload)")
-        }
-    }
-    
-    func sendFilenamesRequest() {
-        guard let characteristic = gatewayCharacteristic else {
-            appState.log("ERROR: Gateway characteristic not available")
-            return
-        }
-        
-        let payload = "{\"send_filenames\": true}"
-        
-        if let data = payload.data(using: .utf8) {
-            connectedPeripheral?.writeValue(data, for: characteristic, type: .withResponse)
-            appState.log("SENT: \(payload)")
-        }
-    }
-    
-    func clearMemory() {
-        guard let characteristic = gatewayCharacteristic else {
-            appState.log("ERROR: Gateway characteristic not available")
-            return
-        }
-        
-        let payload = "{\"clear_memory\": true}"
-        
-        if let data = payload.data(using: .utf8) {
-            connectedPeripheral?.writeValue(data, for: characteristic, type: .withResponse)
-            appState.log("SENT: \(payload)")
-            
-            DispatchQueue.main.async {
-                self.appState.availablePackages = []
-                self.appState.selectedPackageDate = ""
-                self.appState.isTransferringPackage = false
-                self.appState.transferProgress = ""
-                self.appState.log("Device memory cleared")
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            guard let payload = String(data: jsonData, encoding: .utf8) else {
+                appState.log("ERROR: Gateway JSON UTF-8 encode failed")
+                return false
             }
+            connectedPeripheral?.writeValue(jsonData, for: characteristic, type: .withResponse)
+            appState.log("SENT: \(payload)")
+            return true
+        } catch {
+            appState.log("ERROR: Failed to serialize gateway JSON - \(error.localizedDescription)")
+            return false
         }
     }
-    
-    func resetToShelfMode() {
-        guard let characteristic = gatewayCharacteristic else {
+
+    private func sendTimestampAndFilenamesRequest() {
+        let timestamp = Int(Date().timeIntervalSince1970)
+        writeGatewayJSONObject([
+            "timestamp": timestamp,
+            "sendFilenames": true
+        ])
+    }
+
+    func clearMemory() {
+        guard gatewayCharacteristic != nil else {
             appState.log("ERROR: Gateway characteristic not available")
             return
         }
-        
-        let payload = "{\"reset\": true}"
-        
-        if let data = payload.data(using: .utf8) {
-            connectedPeripheral?.writeValue(data, for: characteristic, type: .withResponse)
-            appState.log("SENT: \(payload)")
+        guard writeGatewayJSONObject(["clearMemory": true]) else { return }
+        DispatchQueue.main.async {
+            self.appState.memoryLevel = 0
+            self.appState.availablePackages = []
+            self.appState.selectedPackageDate = ""
+            self.appState.isTransferringPackage = false
+            self.appState.transferProgress = ""
+            self.appState.log("Device memory cleared")
         }
+    }
+
+    func resetToShelfMode() {
+        guard gatewayCharacteristic != nil else {
+            appState.log("ERROR: Gateway characteristic not available")
+            return
+        }
+        _ = writeGatewayJSONObject(["reset": true])
     }
     
     func readRSSI() {
@@ -436,8 +471,12 @@ class BLEManager: NSObject, ObservableObject {
     }
     
     func saveSettings() {
-        guard let characteristic = gatewayCharacteristic else {
+        guard gatewayCharacteristic != nil else {
             appState.log("ERROR: Gateway characteristic not available")
+            return
+        }
+        guard appState.hasFullNodeDeviceSettings else {
+            appState.log("ERROR: Push skipped — node has not reported full device settings")
             return
         }
 
@@ -445,10 +484,10 @@ class BLEManager: NSObject, ObservableObject {
         appState.subjectID = trimmedSubject
 
         var command: [String: Any] = [
-            "subject_id": trimmedSubject,
-            "adv_interval": appState.advOff ? 0 : appState.advInterval,
-            "scan_interval": appState.scanOff ? 0 : appState.scanInterval,
-            "inactivity_multiplier": max(1, min(5, appState.inactivityMultiplier))
+            "subjectId": trimmedSubject,
+            "advInterval": appState.advOff ? 0 : appState.advInterval,
+            "scanInterval": appState.scanOff ? 0 : appState.scanInterval,
+            "inactivityMultiplier": max(1, min(5, appState.inactivityMultiplier))
         ]
 
         let trimmedExperiment = appState.experiment.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -456,19 +495,12 @@ class BLEManager: NSObject, ObservableObject {
             command["experiment"] = trimmedExperiment
         }
 
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: command)
-            if let payload = String(data: jsonData, encoding: .utf8) {
-                connectedPeripheral?.writeValue(jsonData, for: characteristic, type: .withResponse)
-                appState.log("SENT: \(payload)")
-                appState.pushFeedback = "Pushed"
-                appState.captureSettingsBaseline()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak appState] in
-                    appState?.pushFeedback = ""
-                }
+        if writeGatewayJSONObject(command) {
+            appState.pushFeedback = "Pushed"
+            appState.captureSettingsBaseline()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak appState] in
+                appState?.pushFeedback = ""
             }
-        } catch {
-            appState.log("ERROR: Failed to serialize settings - \(error.localizedDescription)")
         }
     }
     
@@ -568,10 +600,7 @@ class BLEManager: NSObject, ObservableObject {
         sessionHandshakeStarted = true
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.sendTimestamp()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.sendFilenamesRequest()
-            }
+            self.sendTimestampAndFilenamesRequest()
         }
     }
 }
@@ -630,8 +659,10 @@ extension BLEManager: CBCentralManagerDelegate {
         
         stagingContent = ""
         sessionHandshakeStarted = false
+        filenameListingBuffer = ""
         appState.transferredDateKeys.removeAll()
         appState.clearSettingsBaseline()
+        appState.resetNodeDeviceSettingsAvailability()
         connectedPeripheral = peripheral
         peripheral.delegate = self
         peripheral.discoverServices([HublinkUUIDs.service])
@@ -646,6 +677,7 @@ extension BLEManager: CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        appState.endShelfDisconnectAwait()
         appState.isConnected = false
         appState.connectedDevice = nil
         appState.connectionStatus = "Disconnected"
@@ -662,6 +694,9 @@ extension BLEManager: CBCentralManagerDelegate {
         fileTransferCharacteristic = nil
         gatewayCharacteristic = nil
         nodeCharacteristic = nil
+        sessionHandshakeStarted = false
+        filenameListingBuffer = ""
+        stagingContent = ""
         
         // Clear any pending timers
         appState.cancelClearDevices()
@@ -678,11 +713,100 @@ extension BLEManager: CBCentralManagerDelegate {
         appState.memoryLevel = nil
         appState.firmwareVersion = nil
         appState.clearSettingsBaseline()
+        appState.resetNodeDeviceSettingsAvailability()
     }
 }
 
 // MARK: - CBPeripheralDelegate
 extension BLEManager: CBPeripheralDelegate {
+    /// Avoid flooding the terminal with megabytes of CSV during file transfer; still log control/listing frames.
+    private func shouldLogReceivedPayload(characteristic: CBCharacteristic, utf8 payload: String) -> Bool {
+        if characteristic.uuid == HublinkUUIDs.filename {
+            let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed == "EOF" || trimmed == "NFF" { return true }
+            if payload.contains("|"), payload.contains(";") { return true }
+            return payload.count <= 200
+        }
+        guard characteristic.uuid == HublinkUUIDs.fileTransfer else { return true }
+        let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == "EOF" || trimmed == "NFF" { return true }
+        if payload.contains("|"), payload.contains(";"), payload.contains("EOF") { return true }
+        return false
+    }
+
+    /// Parses a complete file-listing buffer (`name|size;…`). Completion is signaled by a separate `EOF` indication (buffer may not contain the literal `EOF`) or by `;…EOF` in one chunk.
+    private func processFilenameListingPayload(_ buffer: String) {
+        let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            DispatchQueue.main.async {
+                self.appState.availablePackages = []
+                self.appState.selectedPackageDate = ""
+                self.appState.log("File listing: empty")
+            }
+            return
+        }
+        guard trimmed.contains("|") else { return }
+
+        var namesInListing: [String] = []
+        for raw in trimmed.components(separatedBy: ";") {
+            let component = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !component.isEmpty else { continue }
+            if component == "EOF" { continue }
+            guard let pipe = component.firstIndex(of: "|") else { continue }
+            let name = String(component[..<pipe]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, name != "EOF" {
+                namesInListing.append(name)
+            }
+        }
+
+        let connectedDeviceID = self.appState.connectedDevice?.name ?? "JX_UNKNOWN"
+        var packageMap: [String: DailyPackage] = [:]
+        var jxCsvCount = 0
+        for name in namesInListing {
+            guard let key = PackageStore.dateKey(from: name) else { continue }
+            jxCsvCount += 1
+            if packageMap[key] == nil {
+                packageMap[key] = DailyPackage(dateKey: key, deviceID: connectedDeviceID, files: [:])
+            }
+            packageMap[key]!.files[name] = URL(fileURLWithPath: name)
+        }
+        let packages = packageMap.values.sorted { $0.dateKey > $1.dateKey }
+
+        DispatchQueue.main.async {
+            self.appState.availablePackages = packages
+            let validKeys = Set(packages.map { $0.dateKey })
+            if !validKeys.contains(self.appState.selectedPackageDate) {
+                self.appState.selectedPackageDate = packages.first?.dateKey ?? ""
+            }
+            self.appState.log("File listing: \(namesInListing.count) name(s), \(jxCsvCount) JX*.csv in package format → \(packages.count) daily package(s) on device")
+        }
+    }
+
+    /// Handles UTF-8 payloads on the filename characteristic (chunked listing + `NFF`).
+    private func handleFilenameCharacteristicUTF8(_ string: String) {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == "NFF" {
+            filenameListingBuffer = ""
+            DispatchQueue.main.async {
+                self.appState.log("ERROR: File not found on device")
+                self.stagingContent = ""
+            }
+            return
+        }
+        if trimmed == "EOF" {
+            let buf = filenameListingBuffer
+            filenameListingBuffer = ""
+            processFilenameListingPayload(buf)
+            return
+        }
+        filenameListingBuffer += string
+        let buf = filenameListingBuffer
+        if buf.contains("|"), buf.contains("EOF") {
+            filenameListingBuffer = ""
+            processFilenameListingPayload(buf)
+        }
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil else {
             appState.log("ERROR: Service discovery failed - \(error!.localizedDescription)")
@@ -727,7 +851,7 @@ extension BLEManager: CBPeripheralDelegate {
             peripheral.setNotifyValue(true, for: fileTransferChar)
         }
         
-        // Read node characteristic first; gateway handshake runs after firmware check.
+        // Read node characteristic first; gateway handshake runs after node payload is handled.
         checkAndReadNode()
     }
     
@@ -754,7 +878,9 @@ extension BLEManager: CBPeripheralDelegate {
 
         // Try to decode as UTF-8 string first (for commands/responses)
         if let string = String(data: data, encoding: .utf8) {
-            appState.log("RECEIVED: \(string)")
+            if shouldLogReceivedPayload(characteristic: characteristic, utf8: string) {
+                appState.log("RECEIVED: \(string)")
+            }
             
             // Handle node characteristic response (device info JSON)
             if characteristic.uuid == HublinkUUIDs.node {
@@ -762,21 +888,21 @@ extension BLEManager: CBPeripheralDelegate {
                     if let jsonData = string.data(using: .utf8),
                        let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
 
-                        if let battery = json["battery_level"] as? Int {
+                        if let battery = json["batteryLevel"] as? Int {
                             DispatchQueue.main.async {
                                 self.appState.batteryLevel = battery
                                 self.appState.log("Device battery level: \(battery)%")
                             }
                         }
 
-                        if let memory = json["memory_level"] as? Int {
+                        if let memory = json["memoryLevel"] as? Int {
                             DispatchQueue.main.async {
                                 self.appState.memoryLevel = memory
                                 self.appState.log("Device memory level: \(memory)%")
                             }
                         }
 
-                        if let subjectID = json["subject_id"] as? String {
+                        if let subjectID = json["subjectId"] as? String {
                             DispatchQueue.main.async {
                                 self.appState.subjectID = subjectID
                             }
@@ -788,7 +914,7 @@ extension BLEManager: CBPeripheralDelegate {
                             }
                         }
 
-                        if let advInterval = json["adv_interval"] as? Int {
+                        if let advInterval = json["advInterval"] as? Int {
                             DispatchQueue.main.async {
                                 if advInterval <= 0 {
                                     self.appState.advOff = true
@@ -799,7 +925,7 @@ extension BLEManager: CBPeripheralDelegate {
                             }
                         }
 
-                        if let scanInterval = json["scan_interval"] as? Int {
+                        if let scanInterval = json["scanInterval"] as? Int {
                             DispatchQueue.main.async {
                                 if scanInterval <= 0 {
                                     self.appState.scanOff = true
@@ -810,17 +936,17 @@ extension BLEManager: CBPeripheralDelegate {
                             }
                         }
 
-                        if let multiplier = json["inactivity_multiplier"] as? Int {
+                        if let multiplier = json["inactivityMultiplier"] as? Int {
                             DispatchQueue.main.async {
                                 self.appState.inactivityMultiplier = max(1, min(5, multiplier))
                             }
                         }
 
-                        if let deviceId = json["device_id"] as? String {
+                        if let deviceId = json["deviceId"] as? String {
                             appState.log("Device ID: \(deviceId)")
                         }
 
-                        let firmware = json["firmware_version"] as? String
+                        let firmware = json["firmwareVersion"] as? String
                         if let firmware = firmware {
                             DispatchQueue.main.async {
                                 self.appState.firmwareVersion = firmware
@@ -828,24 +954,47 @@ extension BLEManager: CBPeripheralDelegate {
                             }
                         }
 
-                        if let firmware = firmware, firmware.hasPrefix("5.8") {
-                            // Capture the node's settings as the "clean" baseline after all
-                            // dispatched updates above have been applied.
-                            DispatchQueue.main.async {
+                        let settingsFieldsComplete = AppState.nodePayloadHasAllDeviceSettingsFields(json)
+                        // Firmware 5.8 gate (disabled): session used to run only when `firmware?.hasPrefix("5.8")`; else branch disconnected (see comment block below).
+                        DispatchQueue.main.async {
+                            self.appState.isBaseStationConnection = !settingsFieldsComplete
+                            self.appState.hasFullNodeDeviceSettings = settingsFieldsComplete
+                            if settingsFieldsComplete {
                                 self.appState.captureSettingsBaseline()
+                            } else {
+                                self.appState.clearSettingsBaseline()
+                                if !self.appState.didLogBaseStationNotice {
+                                    self.appState.didLogBaseStationNotice = true
+                                    self.appState.log("Detected Base Station Connection")
+                                }
                             }
-                            startSessionHandshake()
-                        } else {
-                            DispatchQueue.main.async {
-                                self.appState.log("ERROR: Incompatible firmware (\(firmware ?? "unknown")) - disconnecting")
-                                self.appState.showIncompatibleFirmwareAlert = true
-                            }
-                            forceDisconnect()
+                            self.startSessionHandshake()
+                        }
+                        /*
+                        Firmware 5.8 gate (disabled): wrap the `DispatchQueue.main.async` above in
+                          `if let firmware = firmware, firmware.hasPrefix("5.8") { … }`
+                          and restore the else branch: clear hasFull/isBaseStation, incompatible alert, `forceDisconnect()`.
+                        */
+                    } else {
+                        DispatchQueue.main.async {
+                            self.appState.hasFullNodeDeviceSettings = false
+                            self.appState.isBaseStationConnection = false
+                            self.appState.clearSettingsBaseline()
                         }
                     }
                 } catch {
+                    DispatchQueue.main.async {
+                        self.appState.hasFullNodeDeviceSettings = false
+                        self.appState.isBaseStationConnection = false
+                        self.appState.clearSettingsBaseline()
+                    }
                     appState.log("ERROR: Failed to parse node characteristic JSON - \(error.localizedDescription)")
                 }
+                return
+            }
+
+            if characteristic.uuid == HublinkUUIDs.filename {
+                handleFilenameCharacteristicUTF8(string)
                 return
             }
             
@@ -870,38 +1019,7 @@ extension BLEManager: CBPeripheralDelegate {
                 return
             }
 
-            // File listing response: "JXV20260507.csv|1234;JXS20260507.csv|5678;EOF"
-            if string.contains("|") && string.contains(";") && string.contains("EOF") {
-                let components = string.components(separatedBy: ";")
-                var filenames: [String] = []
-                for component in components {
-                    if component.contains("|") && !component.contains("EOF") {
-                        let name = component.components(separatedBy: "|").first ?? ""
-                        if !name.isEmpty { filenames.append(name) }
-                    }
-                }
-
-                // Group into DailyPackages by dateKey
-                let connectedDeviceID = self.appState.connectedDevice?.name ?? "JX_UNKNOWN"
-                var packageMap: [String: DailyPackage] = [:]
-                for name in filenames {
-                    guard let key = PackageStore.dateKey(from: name) else { continue }
-                    if packageMap[key] == nil {
-                        packageMap[key] = DailyPackage(dateKey: key, deviceID: connectedDeviceID, files: [:])
-                    }
-                    packageMap[key]!.files[name] = URL(fileURLWithPath: name)
-                }
-                let packages = packageMap.values.sorted { $0.dateKey > $1.dateKey }
-
-                DispatchQueue.main.async {
-                    self.appState.availablePackages = packages
-                    let validKeys = Set(packages.map { $0.dateKey })
-                    if !validKeys.contains(self.appState.selectedPackageDate) {
-                        self.appState.selectedPackageDate = packages.first?.dateKey ?? ""
-                    }
-                    self.appState.log("Found \(packages.count) daily package(s) on device")
-                }
-            } else if characteristic.uuid == HublinkUUIDs.fileTransfer {
+            if characteristic.uuid == HublinkUUIDs.fileTransfer {
                 stagingContent += string
             }
         } else if characteristic.uuid == HublinkUUIDs.fileTransfer {
@@ -989,7 +1107,6 @@ struct ContentView: View {
     enum AppTab: Hashable { case device, packages, terminal, info }
 
     @State private var selectedTab: AppTab = .device
-    @State private var showTerminalSheet = false
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -1002,25 +1119,20 @@ struct ContentView: View {
             .environmentObject(packageStore)
             .tag(AppTab.packages)
             .tabItem { Label("Packages", systemImage: "folder") }
-            // Placeholder tab; tapping it presents the terminal sheet via onChange below.
-            Color.clear
-                .tag(AppTab.terminal)
-                .tabItem { Label("Terminal", systemImage: "terminal") }
+            NavigationStack {
+                TerminalTabView(appState: appState)
+            }
+            .tag(AppTab.terminal)
+            .tabItem { Label("Terminal", systemImage: "terminal") }
             NavigationStack {
                 InfoAboutView()
             }
             .tag(AppTab.info)
             .tabItem { Label("Info", systemImage: "info.circle") }
         }
-        .onChange(of: selectedTab) { oldValue, newValue in
-            if newValue == .terminal {
-                showTerminalSheet = true
-                selectedTab = oldValue
-            }
-        }
-        .sheet(isPresented: $showTerminalSheet) {
-            TerminalSheet(appState: appState)
-        }
+        .background(
+            DeviceTabBarTintRefresher(isConnected: appState.isConnected, selectedTab: selectedTab)
+        )
         .onAppear {
             Self.applyDeviceTabBarConnectedTint(isConnected: appState.isConnected)
         }
@@ -1030,16 +1142,38 @@ struct ContentView: View {
         .onChange(of: selectedTab) { _, _ in
             Self.applyDeviceTabBarConnectedTint(isConnected: appState.isConnected)
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("UITabBarControllerSelectionDidChange"))) { _ in
+            Self.applyDeviceTabBarConnectedTint(isConnected: appState.isConnected)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            Self.applyDeviceTabBarConnectedTint(isConnected: appState.isConnected)
+        }
+    }
+
+    /// Re-applies green Device tab styling from SwiftUI's update cycle (tab switches often reset `UITabBarItem`).
+    private struct DeviceTabBarTintRefresher: UIViewControllerRepresentable {
+        let isConnected: Bool
+        let selectedTab: AppTab
+
+        func makeUIViewController(context: Context) -> UIViewController {
+            let vc = UIViewController()
+            vc.view.isUserInteractionEnabled = false
+            vc.view.backgroundColor = .clear
+            return vc
+        }
+
+        func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
+            ContentView.applyDeviceTabBarConnectedTint(isConnected: isConnected)
+        }
     }
 
     /// SwiftUI tab items ignore conditional `foregroundStyle` for the inactive tab; set the underlying
     /// `UITabBarItem` image and title attributes directly. Re-applied on tab changes because SwiftUI
     /// may restore its own tab item rendering when switching tabs.
     private static func applyDeviceTabBarConnectedTint(isConnected: Bool) {
-        // Two passes: now and on the next runloop tick. SwiftUI sometimes overwrites
-        // the underlying UITabBarItem after a tab switch; the second pass wins.
         DispatchQueue.main.async { apply(isConnected: isConnected) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { apply(isConnected: isConnected) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { apply(isConnected: isConnected) }
     }
 
     private static func apply(isConnected: Bool) {
@@ -1069,9 +1203,11 @@ struct ContentView: View {
     private static func findRootTabBarController() -> UITabBarController? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         for scene in scenes {
-            let root = scene.windows.first { $0.isKeyWindow }?.rootViewController
-                ?? scene.windows.first?.rootViewController
-            if let tab = findTabBarRecursively(from: root) { return tab }
+            for window in scene.windows {
+                if let tab = findTabBarRecursively(from: window.rootViewController) {
+                    return tab
+                }
+            }
         }
         return nil
     }
@@ -1097,6 +1233,27 @@ struct ContentView: View {
             }
         }
         .background(Color(.systemBackground))
+        .overlay {
+            if appState.showShelfDisconnectOverlay {
+                ZStack {
+                    Color.black.opacity(0.5)
+                        .ignoresSafeArea()
+                    VStack(spacing: 14) {
+                        ProgressView()
+                            .scaleEffect(1.1)
+                        Text("Disconnecting...")
+                            .font(.system(size: 18, weight: .semibold))
+                        Text("Resetting device to shelf mode")
+                            .font(.system(size: 14))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(28)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+                .allowsHitTesting(true)
+            }
+        }
     }
     
     // MARK: - Clock View
@@ -1298,7 +1455,11 @@ struct ContentView: View {
                 .buttonStyle(JuxtaButtonStyle(color: .red, isDestructive: true))
             }
             
-            deviceSettingsCard
+            if appState.isBaseStationConnection {
+                baseStationConnectionBanner
+            } else if appState.hasFullNodeDeviceSettings {
+                deviceSettingsCard
+            }
 
             dailyPackagesCard
 
@@ -1337,7 +1498,10 @@ struct ContentView: View {
         }
         .alert("Shelf Mode", isPresented: $appState.showShelfModeAlert) {
             Button("Cancel", role: .cancel) { }
-            Button("Reset to Shelf Mode", role: .destructive) { bleManager.resetToShelfMode() }
+            Button("Reset to Shelf Mode", role: .destructive) {
+                appState.beginShelfDisconnectAwait()
+                bleManager.resetToShelfMode()
+            }
         } message: {
             Text("This will reset the device to shelf mode. The device will restart and return to its default state.")
         }
@@ -1352,8 +1516,26 @@ struct ContentView: View {
                 appState.resetSettingsToDefaults()
             }
         } message: {
-            Text("Advertising interval will be set to 1 s, scanning interval to 20 s, and the inactivity scan multiplier to 2×. Tap Push to send these values to the device.")
+            Text("Advertising interval will be set to 10 s, scanning interval to 10 s, and the inactivity scan multiplier to 5×. Tap Push to send these values to the device.")
         }
+    }
+
+    // MARK: - Base station (no device settings on node)
+
+    private var baseStationConnectionBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundColor(.secondary)
+            Text("Detected Base Station Connection")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.primary)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .accessibilityIdentifier("DetectedBaseStationConnection")
     }
 
     // MARK: - Inline Device Settings card
@@ -1492,8 +1674,6 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.2), value: appState.hasUnsavedSettings)
     }
 
-    // MARK: - Inline Daily Packages card
-
     private var dailyPackagesCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -1574,7 +1754,7 @@ struct ContentView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(isSelected ? Color.blue.opacity(0.15) : Color(.systemBackground))
+            .background(isSelected ? Color.blue.opacity(0.34) : Color(.systemBackground))
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
@@ -2360,65 +2540,59 @@ struct InfoAboutView: View {
     }
 }
 
-// MARK: - Terminal Sheet
-struct TerminalSheet: View {
+// MARK: - Terminal tab
+struct TerminalTabView: View {
     @ObservedObject var appState: AppState
-    @Environment(\.dismiss) private var dismiss
     @State private var copyConfirmation = ""
 
     var body: some View {
-        NavigationView {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(appState.terminalLog.enumerated()), id: \.offset) { index, line in
-                            Text(line)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.green)
-                                .textSelection(.enabled)
-                                .id(index)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .background(Color.black)
-                .onChange(of: appState.terminalLog.count) { _, _ in
-                    if let lastIndex = appState.terminalLog.indices.last {
-                        withAnimation(.easeOut(duration: 0.1)) {
-                            proxy.scrollTo(lastIndex, anchor: .bottom)
-                        }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(appState.terminalLog.enumerated()), id: \.offset) { index, line in
+                        Text(line)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.green)
+                            .textSelection(.enabled)
+                            .id(index)
                     }
                 }
-                .onAppear {
-                    if let lastIndex = appState.terminalLog.indices.last {
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(Color.black)
+            .onChange(of: appState.terminalLog.count) { _, _ in
+                if let lastIndex = appState.terminalLog.indices.last {
+                    withAnimation(.easeOut(duration: 0.1)) {
                         proxy.scrollTo(lastIndex, anchor: .bottom)
                     }
                 }
             }
-            .navigationTitle("Terminal")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Done") { dismiss() }
+            .onAppear {
+                if let lastIndex = appState.terminalLog.indices.last {
+                    proxy.scrollTo(lastIndex, anchor: .bottom)
                 }
-                ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    Button(action: clearLog) {
-                        Image(systemName: "trash")
-                    }
-                    .disabled(appState.terminalLog.isEmpty)
+            }
+        }
+        .navigationTitle("Terminal")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button(action: clearLog) {
+                    Image(systemName: "trash")
+                }
+                .disabled(appState.terminalLog.isEmpty)
 
-                    Button(action: copyLog) {
-                        HStack(spacing: 4) {
-                            Image(systemName: copyConfirmation.isEmpty ? "doc.on.doc" : "checkmark")
-                            if !copyConfirmation.isEmpty {
-                                Text(copyConfirmation).font(.system(size: 12))
-                            }
+                Button(action: copyLog) {
+                    HStack(spacing: 4) {
+                        Image(systemName: copyConfirmation.isEmpty ? "doc.on.doc" : "checkmark")
+                        if !copyConfirmation.isEmpty {
+                            Text(copyConfirmation).font(.system(size: 12))
                         }
                     }
-                    .disabled(appState.terminalLog.isEmpty)
                 }
+                .disabled(appState.terminalLog.isEmpty)
             }
         }
     }

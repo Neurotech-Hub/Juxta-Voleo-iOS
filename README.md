@@ -6,18 +6,18 @@ Developed by the [Neurotech Hub](https://neurotechhub.wustl.edu) at Washington U
 
 ## Overview
 
-Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes session settings (Subject ID, Experiment, advertising/scanning intervals, inactivity scan multiplier), discovers the daily files on the device, and pulls them down as locally stored CSV "Daily Packages" you can browse, plot, share, and copy long after disconnecting.
+Voleo is the iOS companion for Juxta 5.8+ devices. It reads the node (camelCase JSON), writes session settings over the gateway (camelCase JSON, UTC `timestamp`), discovers the daily files on the device, and pulls them down as locally stored CSV "Daily Packages" you can browse, plot, share, and copy long after disconnecting.
 
 ## Features
 
 - **BLE scan & connect** with custom service UUID
-- **Firmware gate** — disconnects from any device not reporting `firmware_version` starting with `5.8`
+- **Firmware** — reads `firmwareVersion` from the node; a strict 5.8-only disconnect gate may be enabled in code for specific builds
 - **Session settings sync** — Subject ID, Experiment, advertising interval, scanning interval, inactivity scan multiplier; values are read from the node on connect and pushed back from the inline Device Settings card
 - **Daily Packages** — groups `JXV/JXS/JXB YYYYMMDD.csv` files for a day, transfers all three at once, and stores them under `Documents/<device_id>/`
 - **Packages tab** — browse all locally stored packages across all devices, plus per-package detail with raw text, **View Plots** (Vitals: battery / temperature / motion; BLE Activity: peer-vs-time scatter color-coded by RSSI), **View Table** (Settings), Copy All, and Share
 - **Terminal tab** — full BLE log with copy / clear
 - **Info tab** — app version, DFU note (uses Nordic **nRF Connect** with developer-supplied firmware), and magnet-gesture / LED reference
-- **Visual connection cue** — Device tab icon turns green while connected; battery glyph reflects the reported percent
+- **Visual connection cue** — while connected, the **Device** tab icon and label stay green (including on other tabs); battery glyph reflects the reported percent
 
 ## Requirements
 
@@ -38,15 +38,15 @@ Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes
 ### Scan & connect
 
 - Open the **Device** tab and tap **Scan** to discover Juxta devices (filtered by the service UUID below).
-- Tap **Connect** on a discovered device. After service discovery, Voleo validates firmware and reads the node payload (battery, memory, firmware version, subject, experiment, advertising/scanning intervals, inactivity scan multiplier).
-- If firmware doesn't start with `5.8`, Voleo disconnects and shows an **Incompatible Voleo (v5.8) device** alert.
+- Tap **Connect** on a discovered device. After service discovery, Voleo reads the node payload (camelCase JSON: battery, memory, firmware version, subject, experiment, advertising/scanning intervals, inactivity multiplier).
+- If a firmware-version gate is enabled in the build and `firmwareVersion` does not start with `5.8`, Voleo disconnects and may show an **Incompatible Voleo (v5.8) device** alert.
 
 ### Device Settings (push)
 
 - Edit Subject ID, Experiment, advertising interval (1–10 s, step 1), scanning interval (5–60 s, step 5), and the inactivity scan multiplier in the inline card.
 - Each interval has an **Off** toggle to the right of its slider; turning it on disables the slider and sends `0` for that interval (advertising or scanning disabled on the node).
-- The inactivity scan multiplier is a segmented control with `1×…5×`; the selected integer is sent as `inactivity_multiplier` and is applied to the scan interval during inactivity (`1×` effectively disables the multiplier).
-- **Push** writes the values to the device. **Default** asks for confirmation, then restores Adv `1 s`, Scan `20 s`, Inactivity Scan Multiplier `2×`, and clears both **Off** toggles locally (you still need to **Push** to send them).
+- The inactivity scan multiplier is a segmented control with `1×…5×`; the selected integer is sent as `inactivityMultiplier` and is applied to the scan interval during inactivity (`1×` effectively disables the multiplier).
+- **Push** writes the values to the device. **Default** asks for confirmation, then restores Adv `10 s`, Scan `10 s`, Inactivity Scan Multiplier `5×`, and clears both **Off** toggles locally (you still need to **Push** to send them).
 
 ### Daily Packages
 
@@ -57,12 +57,12 @@ Voleo is the iOS companion for Juxta 5.8+ devices. It validates firmware, writes
 
 ### Maintenance
 
-- **Shelf Mode** — sends `{"reset": true}` after a confirmation alert.
-- **Clear Memory** — sends `{"clear_memory": true}` after a confirmation alert.
+- **Shelf Mode** — sends `{"reset": true}` (gateway, camelCase) after a confirmation alert.
+- **Clear Memory** — sends `{"clearMemory": true}` after a confirmation alert.
 
 ### Terminal
 
-The Terminal tab opens a full-screen sheet with the BLE log. Copy or clear from the toolbar.
+The **Terminal** tab shows the full BLE log with copy and clear actions in the navigation bar (same pattern as **Packages** and **Info**).
 
 ## BLE Protocol
 
@@ -76,68 +76,69 @@ The app communicates using these UUIDs:
 
 ### Node Characteristic Payload (READ)
 
-On connect the app reads the node characteristic and expects a JSON object with **snake_case** keys. The app parses the keys below; any additional keys are ignored. Firmware **must** report a `firmware_version` that starts with `"5.8"` or the app disconnects.
+On connect the app reads the node characteristic and expects a JSON object with **camelCase** keys. The app parses the keys below; any additional keys are ignored.
 
 ```json
 {
-  "upload_path": "<from NVS>",
-  "firmware_version": "5.8.0",
-  "battery_level": 85,
-  "device_id": "JX_XXXXXX",
+  "uploadPath": "<from NVS>",
+  "firmwareVersion": "5.8.0",
+  "batteryLevel": 85,
+  "memoryLevel": 42,
+  "deviceId": "JX_XXXXXX",
   "alert": "",
   "product": "Juxta5-8",
-  "log_schema": "jxta-nor-csv-v4",
-  "logging_version": 4,
+  "logSchema": "jxta-nor-csv-v4",
+  "loggingVersion": 4,
   "experiment": "<from NVS>",
-  "subject_id": "<from NVS>",
-  "adv_interval": 5,
-  "scan_interval": 20,
-  "inactivity_multiplier": 2
+  "subjectId": "<from NVS>",
+  "advInterval": 5,
+  "scanInterval": 20,
+  "inactivityMultiplier": 2
 }
 ```
 
-| Key                  | Type    | App behavior                                                                 |
-| -------------------- | ------- | ---------------------------------------------------------------------------- |
-| `firmware_version`   | string  | Must start with `"5.8"`; otherwise the app disconnects with an alert.        |
-| `battery_level`      | int     | Shown in connected header.                                                   |
-| `memory_level`       | int     | Shown in connected header (optional; only displayed if present).             |
-| `device_id`          | string  | Used as the device folder name for stored packages and logged on connect.    |
-| `subject_id`         | string  | Populates the Subject ID field in Settings.                                  |
-| `experiment`         | string  | Populates the Experiment field in Settings.                                  |
-| `adv_interval`       | int     | Populates the Advertising Interval slider (clamped 1–10s). `0` flips the row's **Off** toggle on and disables the slider. |
-| `scan_interval`      | int     | Populates the Scanning Interval slider (clamped 5–60s, step 5). `0` flips the row's **Off** toggle on and disables the slider. |
-| `inactivity_multiplier` | int  | Populates the "Inactivity Scan Multiplier" segmented control (clamped 1–5). |
-| other keys           | any     | Ignored.                                                                     |
+| Key                     | Type   | App behavior                                                                 |
+| ----------------------- | ------ | ---------------------------------------------------------------------------- |
+| `firmwareVersion`       | string | Shown in header; strict 5.8 disconnect may apply when that gate is enabled. |
+| `batteryLevel`          | int    | Shown in connected header.                                                  |
+| `memoryLevel`           | int    | Shown in connected header (optional; only displayed if present).            |
+| `deviceId`              | string | Logged on connect; packages use the peripheral name as folder key.          |
+| `subjectId`             | string | Populates the Subject ID field in Device Settings.                          |
+| `experiment`            | string | Populates the Experiment field in Device Settings.                         |
+| `advInterval`           | int    | Populates the Advertising Interval slider (clamped 1–10s). `0` turns **Off** on. |
+| `scanInterval`          | int    | Populates the Scanning Interval slider (clamped 5–60s, step 5). `0` turns **Off** on. |
+| `inactivityMultiplier`  | int    | Populates the Inactivity Scan Multiplier control (clamped 1–5).            |
+| other keys              | any    | Ignored.                                                                    |
 
 ### Gateway Characteristic Payload (WRITE)
 
-All gateway commands use **snake_case** keys, matching the node payload. Settings writes omit `experiment` when empty.
+All gateway commands use **camelCase** keys. After a successful node read, the app sends **one** JSON object with UTC `timestamp` and `sendFilenames: true` to start the session (Pi-style). Settings writes omit `experiment` when empty.
 
 ```json
 {
   "timestamp": 1717003200,
-  "send_filenames": true,
-  "clear_memory": true,
+  "sendFilenames": true,
+  "clearMemory": true,
   "reset": true,
-  "subject_id": "001",
+  "subjectId": "001",
   "experiment": "trial-A",
-  "adv_interval": 5,
-  "scan_interval": 20,
-  "inactivity_multiplier": 2
+  "advInterval": 5,
+  "scanInterval": 20,
+  "inactivityMultiplier": 2
 }
 ```
 
-| Key                  | Type    | Notes                                                                            |
-| -------------------- | ------- | -------------------------------------------------------------------------------- |
-| `timestamp`          | int     | Unix epoch seconds, sent automatically after firmware validation.                |
-| `send_filenames`     | bool    | Asks the device to return its file listing.                                      |
-| `clear_memory`       | bool    | Wipes device storage; confirmed via UI alert.                                    |
-| `reset`              | bool    | "Shelf Mode" — gracefully reset the device.                                      |
-| `subject_id`         | string  | Always sent on Push; whitespace-trimmed.                                         |
-| `experiment`         | string  | Sent only when non-empty after trimming.                                         |
-| `adv_interval`       | int     | 1–10s, step 1. Sent as `0` when the row's **Off** toggle is on (advertising disabled). |
-| `scan_interval`      | int     | 5–60s, step 5. Sent as `0` when the row's **Off** toggle is on (scanning disabled).    |
-| `inactivity_multiplier` | int  | Multiplier applied to the scan interval during inactivity. Integer in `1…5` (1 = effectively off, 2 = doubled, etc.). |
+| Key                      | Type | Notes                                                                            |
+| ------------------------ | ---- | -------------------------------------------------------------------------------- |
+| `timestamp`              | int  | Unix **UTC** epoch seconds; combined with `sendFilenames` after connect.       |
+| `sendFilenames`          | bool | Requests the file listing from the device.                                       |
+| `clearMemory`            | bool | Wipes device storage; confirmed via UI alert.                                   |
+| `reset`                  | bool | "Shelf Mode" — gracefully reset the device.                                     |
+| `subjectId`              | str  | Always sent on Push; whitespace-trimmed.                                        |
+| `experiment`             | str  | Sent only when non-empty after trimming.                                       |
+| `advInterval`            | int  | 1–10s, step 1. Sent as `0` when **Off** (advertising disabled).                |
+| `scanInterval`           | int  | 5–60s, step 5. Sent as `0` when **Off** (scanning disabled).                   |
+| `inactivityMultiplier`   | int  | Integer in `1…5` (1 = effectively off).                                        |
 
 ### Daily Packages on disk
 
@@ -157,8 +158,8 @@ The `<YYYYMMDD>` portion is the date key Voleo groups by.
 If you change the JSON schema in either direction:
 
 1. Update this README (the node and gateway tables above).
-2. Update `peripheral(_:didUpdateValueFor:)` in `ContentView.swift` (node parsing).
-3. Update `BLEManager.saveSettings()` / `clearMemory()` / `sendFilenamesRequest()` / `resetToShelfMode()` (gateway writes).
+2. Update `peripheral(_:didUpdateValueFor:)` in `ContentView.swift` (node parsing and filename listing buffer).
+3. Update `BLEManager` gateway helpers (`writeGatewayJSONObject`, `saveSettings()`, `clearMemory()`, `resetToShelfMode()`, `sendTimestampAndFilenamesRequest()`).
 4. Communicate the change to the firmware developer so the node side matches.
 
 ## Firmware update (DFU)
