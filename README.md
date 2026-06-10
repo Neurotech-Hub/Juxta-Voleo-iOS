@@ -1,30 +1,35 @@
 # Voleo (iOS)
 
-Companion app for Juxta 5.8+ wearable devices. Connect over Bluetooth Low Energy, sync session settings, transfer daily data packages, and inspect logs — all from your iPhone.
+Companion app for Juxta 5.8+ wearable devices and Hublink gateways. Connect over Bluetooth Low Energy, sync session settings, transfer daily data packages, and inspect logs — all from your iPhone.
 
 Developed by the [Neurotech Hub](https://neurotechhub.wustl.edu) at Washington University in St. Louis.
 
 ## Overview
 
-Voleo is the iOS companion for Juxta 5.8+ devices. It reads the node (camelCase JSON), writes session settings over the gateway (camelCase JSON, UTC `timestamp`), discovers the daily files on the device, and pulls them down as locally stored CSV "Daily Packages" you can browse, plot, share, and copy long after disconnecting.
+Voleo is the iOS companion for Juxta 5.8+ nodes and gateway-style base stations. It reads the node (camelCase JSON), writes session settings over the gateway (camelCase JSON, UTC `timestamp`), discovers daily files on the device, and pulls them down as locally stored CSV **Daily Packages** you can browse, plot, share, and copy long after disconnecting.
+
+For the full BLE protocol (characteristics, file listing, transfer flow), see [`spec_HUBLINK.md`](spec_HUBLINK.md).
 
 ## Features
 
-- **BLE scan & connect** with custom service UUID
-- **Firmware** — reads `firmwareVersion` from the node; a strict 5.8-only disconnect gate may be enabled in code for specific builds
-- **Session settings sync** — Subject ID, Experiment, advertising interval, scanning interval, inactivity scan multiplier; values are read from the node on connect and pushed back from the inline Device Settings card
-- **Daily Packages** — groups `JXV/JXS/JXB YYYYMMDD.csv` files for a day, transfers all three at once, and stores them under `Documents/<device_id>/`
-- **Packages tab** — browse all locally stored packages across all devices, plus per-package detail with raw text, **View Plots** (Vitals: battery / temperature / motion; BLE Activity: peer-vs-time scatter color-coded by RSSI), **View Table** (Settings), Copy All, and Share
+- **BLE scan & connect** — filtered by the Hublink service UUID; peripherals advertise as `JX_*`
+- **Firmware** — reads `firmwareVersion` from the node; a strict 5.8-only disconnect gate exists in code but is **disabled** in current builds
+- **Wearable vs base station** — if the node JSON includes all Device Settings fields (`subjectId`, `experiment`, `advInterval`, `scanInterval`, `inactivityMultiplier`), the inline **Device Settings** card is shown; otherwise Voleo treats the connection as a **base station** (banner only, no settings card) and still runs the session handshake and file transfer
+- **Session settings sync** — Subject ID, Experiment, advertising interval, scanning interval, inactivity scan multiplier; values are read from the node on connect and pushed back from the Device Settings card (wearables only)
+- **Daily Packages** — groups `JXV` / `JXS` / `JXB` + `YYYYMMDD` CSV files for a day, transfers all three in sequence, and stores them under `Documents/<device_id>/`
+- **Packages tab** — browse all local packages **grouped by device**; devices are ordered by most recently transferred package (file modification time), then by calendar date; each package row shows date, V/S/B file badges, and completeness
+- **Package detail** — truncated raw CSV preview per file; **View Plots** (Vitals / BLE Activity), **View All** (Settings — full CSV in the same preview style), **Copy All**, **Share**
+- **Plots** — Vitals: battery voltage, temperature, optional **lux** and **motion** when those columns exist; BLE Activity: peer vs time (point color = RSSI). CSV parsing tolerates UTF-8 BOM, CRLF, and common export whitespace (typical of SD-card copies)
 - **Terminal tab** — full BLE log with copy / clear
-- **Info tab** — app version, DFU note (uses Nordic **nRF Connect** with developer-supplied firmware), and magnet-gesture / LED reference
-- **Visual connection cue** — while connected, the **Device** tab icon and label stay green (including on other tabs); battery glyph reflects the reported percent
+- **Info tab** — app version, DFU note (Nordic **nRF Connect** + developer-supplied firmware), magnet-gesture / LED reference
+- **Visual connection cue** — while connected, the **Device** tab icon and label stay green (including on other tabs); battery glyph reflects reported percent when present
 
 ## Requirements
 
 - iOS 17.0+
 - Xcode 15.0+
 - A physical Bluetooth-enabled iPhone (BLE does not work in the Simulator)
-- A Juxta 5.8+ device
+- A Juxta 5.8+ device or compatible Hublink gateway / base station
 
 ## Installation
 
@@ -37,46 +42,97 @@ Voleo is the iOS companion for Juxta 5.8+ devices. It reads the node (camelCase 
 
 ### Scan & connect
 
-- Open the **Device** tab and tap **Scan** to discover Juxta devices (filtered by the service UUID below).
-- Tap **Connect** on a discovered device. After service discovery, Voleo reads the node payload (camelCase JSON: battery, memory, firmware version, subject, experiment, advertising/scanning intervals, inactivity multiplier).
-- If a firmware-version gate is enabled in the build and `firmwareVersion` does not start with `5.8`, Voleo disconnects and may show an **Incompatible Voleo (v5.8) device** alert.
+- Open the **Device** tab and tap **Scan** to discover devices (service UUID below).
+- Tap **Connect**. After service discovery, Voleo reads the node payload (camelCase JSON: battery, memory, firmware version, and optionally subject, experiment, intervals).
+- **Wearable:** all Device Settings keys are present → settings card appears; edit and **Push** as needed.
+- **Base station:** one or more settings keys are missing → **Detected Base Station Connection** banner; no Device Settings card; file listing and transfer still work.
+- If the firmware 5.8 gate is re-enabled in a build and `firmwareVersion` does not start with `5.8`, Voleo may disconnect and show **Incompatible Voleo (v5.8) device**.
 
-### Device Settings (push)
+### Device Settings (wearables only)
 
-- Edit Subject ID, Experiment, advertising interval (1–10 s, step 1), scanning interval (5–60 s, step 5), and the inactivity scan multiplier in the inline card.
-- Each interval has an **Off** toggle to the right of its slider; turning it on disables the slider and sends `0` for that interval (advertising or scanning disabled on the node).
-- The inactivity scan multiplier is a segmented control with `1×…5×`; the selected integer is sent as `inactivityMultiplier` and is applied to the scan interval during inactivity (`1×` effectively disables the multiplier).
-- **Push** writes the values to the device. **Default** asks for confirmation, then restores Adv `10 s`, Scan `10 s`, Inactivity Scan Multiplier `5×`, and clears both **Off** toggles locally (you still need to **Push** to send them).
+- Edit Subject ID, Experiment, advertising interval (1–10 s, step 1), scanning interval (5–60 s, step 5), and the inactivity scan multiplier.
+- Each interval has an **Off** toggle; when on, the slider is disabled and `0` is sent for that interval.
+- Inactivity scan multiplier: segmented `1×…5×` (sent as `inactivityMultiplier`; `1×` effectively disables the multiplier on the node).
+- **Push** writes values to the device. **Default** restores Adv `10 s`, Scan `10 s`, multiplier `5×`, clears both **Off** toggles on screen (still requires **Push** to send).
 
-### Daily Packages
+### Daily Packages (on device)
 
-- The connected screen lists daily packages found on the device. Pick a date and tap **Transfer Selected**; Voleo will queue Vitals, Settings, and BLE Activity in turn.
-- Transferred packages get a green checkmark for the duration of the session.
-- Files land in `Documents/<device_id>/` and remain available offline in the **Packages** tab.
-- In the Packages detail screen you can **Copy All** (filenames included in section headers), **Share** (via a temporary directory copy to satisfy iOS sandboxing), **View Plots**, or **View Table**.
+- The connected screen lists daily packages from the device file listing. Select a date and tap **Transfer Selected**; Voleo queues Vitals, Settings, and BLE Activity in turn.
+- Transferred dates show a green checkmark for the session.
+- Files are saved to `Documents/<device_id>/` and remain in the **Packages** tab offline.
+
+### Packages tab (local library)
+
+- Packages are grouped under each **device ID** (`JX_*` folder name).
+- Within a device, packages are newest-first (by local file write time, then `YYYYMMDD` date key).
+- Tap a package for detail: preview snippets, **View Plots**, **View All** (Settings), **Copy All**, **Share**, swipe-to-delete.
 
 ### Maintenance
 
-- **Shelf Mode** — sends `{"reset": true}` (gateway, camelCase) after a confirmation alert.
-- **Clear Memory** — sends `{"clearMemory": true}` after a confirmation alert.
+- **Shelf Mode** — `{"reset": true}` on the gateway (confirmed).
+- **Clear Memory** — `{"clearMemory": true}` on the gateway (confirmed).
 
 ### Terminal
 
-The **Terminal** tab shows the full BLE log with copy and clear actions in the navigation bar (same pattern as **Packages** and **Info**).
+The **Terminal** tab shows the full BLE log with copy and clear in the navigation bar.
+
+## CSV file formats (plots & preview)
+
+Voleo does not require every column below; plotting uses what is present. Headers are matched case-insensitively after trimming.
+
+### Vitals — `JXV<YYYYMMDD>.csv`
+
+| Column (typical)   | Used for                          |
+| ------------------ | --------------------------------- |
+| `unix`             | Required — X-axis time (epoch s)  |
+| `batt_v`           | Battery voltage chart             |
+| `temp_c`           | Temperature chart                 |
+| `lux`              | Lux chart (only if column exists) |
+| `motion`           | Motion chart (only if column exists) |
+| `datetime`, `batt_per`, `humidity_pct`, `gas_kohm`, … | Shown in raw preview / **View All**; not plotted unless listed above |
+
+Example (gateway / base station):
+
+```csv
+unix,datetime,batt_v,batt_per,lux,temp_c,humidity_pct,gas_kohm
+1778790483,2026-05-14 20:28:03,0,0,0.06,28.78,24.84,8.37
+```
+
+### Settings — `JXS<YYYYMMDD>.csv`
+
+Single-row or multi-row key/value CSV; opened via **View All** as full monospaced text (same 10 pt preview styling as the package screen, scrollable).
+
+### BLE Activity — `JXB<YYYYMMDD>.csv`
+
+| Column (typical) | Used for                                      |
+| ---------------- | --------------------------------------------- |
+| `unix`           | Required — X-axis time                        |
+| `peer_id`        | Y-axis peer label (preferred)                 |
+| `observer_id`    | Fallback peer label if `peer_id` is absent    |
+| `rssi`           | Point color (RSSI legend on plot screen)      |
+
+Example:
+
+```csv
+unix,observer_id,peer_id,rssi
+1778790483,JX_BBB32D,JX_563E56,-56
+```
 
 ## BLE Protocol
 
-The app communicates using these UUIDs:
+The app uses these UUIDs (see [`spec_HUBLINK.md`](spec_HUBLINK.md) for listing/transfer details):
 
-- Service: `57617368-5501-0001-8000-00805f9b34fb`
-- Filename: `57617368-5502-0001-8000-00805f9b34fb`
-- File Transfer: `57617368-5503-0001-8000-00805f9b34fb`
-- Gateway: `57617368-5504-0001-8000-00805f9b34fb`
-- Node: `57617368-5505-0001-8000-00805f9b34fb`
+| Role           | UUID                                   |
+| -------------- | -------------------------------------- |
+| Service        | `57617368-5501-0001-8000-00805f9b34fb` |
+| Filename       | `57617368-5502-0001-8000-00805f9b34fb` |
+| File Transfer  | `57617368-5503-0001-8000-00805f9b34fb` |
+| Gateway        | `57617368-5504-0001-8000-00805f9b34fb` |
+| Node           | `57617368-5505-0001-8000-00805f9b34fb` |
 
-### Node Characteristic Payload (READ)
+### Node characteristic (READ)
 
-On connect the app reads the node characteristic and expects a JSON object with **camelCase** keys. The app parses the keys below; any additional keys are ignored.
+On connect the app reads the node characteristic and expects camelCase JSON. Keys used by the app:
 
 ```json
 {
@@ -99,20 +155,22 @@ On connect the app reads the node characteristic and expects a JSON object with 
 
 | Key                     | Type   | App behavior                                                                 |
 | ----------------------- | ------ | ---------------------------------------------------------------------------- |
-| `firmwareVersion`       | string | Shown in header; strict 5.8 disconnect may apply when that gate is enabled. |
-| `batteryLevel`          | int    | Shown in connected header.                                                  |
-| `memoryLevel`           | int    | Shown in connected header (optional; only displayed if present).            |
-| `deviceId`              | string | Logged on connect; packages use the peripheral name as folder key.          |
-| `subjectId`             | string | Populates the Subject ID field in Device Settings.                          |
-| `experiment`            | string | Populates the Experiment field in Device Settings.                         |
-| `advInterval`           | int    | Populates the Advertising Interval slider (clamped 1–10s). `0` turns **Off** on. |
-| `scanInterval`          | int    | Populates the Scanning Interval slider (clamped 5–60s, step 5). `0` turns **Off** on. |
-| `inactivityMultiplier`  | int    | Populates the Inactivity Scan Multiplier control (clamped 1–5).            |
+| `firmwareVersion`       | string | Shown in header; optional 5.8 gate when enabled in code.                    |
+| `batteryLevel`          | int    | Shown in connected header when present.                                     |
+| `memoryLevel`           | int    | Shown in connected header when present.                                       |
+| `deviceId`              | string | Logged on connect; local packages use the peripheral **name** as folder key. |
+| `subjectId`             | string | Device Settings (required for “full” wearable node).                        |
+| `experiment`            | string | Device Settings (required for “full” wearable node).                        |
+| `advInterval`           | int    | Device Settings; `0` → **Off** for advertising.                             |
+| `scanInterval`          | int    | Device Settings; `0` → **Off** for scanning.                                |
+| `inactivityMultiplier`  | int    | Device Settings (1–5).                                                      |
 | other keys              | any    | Ignored.                                                                    |
 
-### Gateway Characteristic Payload (WRITE)
+If any of `subjectId`, `experiment`, `advInterval`, `scanInterval`, or `inactivityMultiplier` is missing, Voleo classifies the device as a **base station** for UI purposes.
 
-All gateway commands use **camelCase** keys. After a successful node read, the app sends **one** JSON object with UTC `timestamp` and `sendFilenames: true` to start the session (Pi-style). Settings writes omit `experiment` when empty.
+### Gateway characteristic (WRITE)
+
+All gateway commands use camelCase keys. After a successful node read, the app sends **one** JSON object with UTC `timestamp` and `sendFilenames: true` to start the session. Settings writes omit `experiment` when empty.
 
 ```json
 {
@@ -133,16 +191,14 @@ All gateway commands use **camelCase** keys. After a successful node read, the a
 | `timestamp`              | int  | Unix **UTC** epoch seconds; combined with `sendFilenames` after connect.       |
 | `sendFilenames`          | bool | Requests the file listing from the device.                                       |
 | `clearMemory`            | bool | Wipes device storage; confirmed via UI alert.                                   |
-| `reset`                  | bool | "Shelf Mode" — gracefully reset the device.                                     |
+| `reset`                  | bool | Shelf Mode — gracefully reset the device.                                       |
 | `subjectId`              | str  | Always sent on Push; whitespace-trimmed.                                        |
 | `experiment`             | str  | Sent only when non-empty after trimming.                                       |
-| `advInterval`            | int  | 1–10s, step 1. Sent as `0` when **Off** (advertising disabled).                |
-| `scanInterval`           | int  | 5–60s, step 5. Sent as `0` when **Off** (scanning disabled).                   |
-| `inactivityMultiplier`   | int  | Integer in `1…5` (1 = effectively off).                                        |
+| `advInterval`            | int  | 1–10 s, step 1. Sent as `0` when **Off**.                                      |
+| `scanInterval`           | int  | 5–60 s, step 5. Sent as `0` when **Off**.                                       |
+| `inactivityMultiplier`   | int  | Integer in `1…5`.                                                              |
 
-### Daily Packages on disk
-
-Transferred files are stored at:
+### Daily packages on disk
 
 ```
 Documents/<device_id>/
@@ -151,27 +207,30 @@ Documents/<device_id>/
   JXB<YYYYMMDD>.csv   # BLE Activity
 ```
 
-The `<YYYYMMDD>` portion is the date key Voleo groups by.
+The `<YYYYMMDD>` segment is the date key used to group the three files into one logical package. A package is **complete** when all three files are present.
 
 ### Schema sync checklist
 
-If you change the JSON schema in either direction:
+If you change the JSON or CSV schema:
 
-1. Update this README (the node and gateway tables above).
-2. Update `peripheral(_:didUpdateValueFor:)` in `ContentView.swift` (node parsing and filename listing buffer).
-3. Update `BLEManager` gateway helpers (`writeGatewayJSONObject`, `saveSettings()`, `clearMemory()`, `resetToShelfMode()`, `sendTimestampAndFilenamesRequest()`).
-4. Communicate the change to the firmware developer so the node side matches.
+1. Update this README and [`spec_HUBLINK.md`](spec_HUBLINK.md).
+2. Update node parsing and filename listing in `ContentView.swift` (`peripheral(_:didUpdateValueFor:)`, `processFilenameListingPayload`, `AppState.nodePayloadHasAllDeviceSettingsFields`).
+3. Update gateway helpers in `BLEManager` (`writeGatewayJSONObject`, `saveSettings()`, `clearMemory()`, `resetToShelfMode()`, `sendTimestampAndFilenamesRequest()`).
+4. Update plot column mapping in `PlotsView` / `parseCSV` if CSV columns change.
+5. Align firmware / gateway firmware with the app team.
 
 ## Firmware update (DFU)
 
 Voleo does not flash firmware. To update a device:
 
-1. Use the magnet gesture to enter DFU mode (see the **Info** tab in the app for the magnet/LED reference).
-2. Use Nordic Semiconductor's **nRF Connect** app to flash a firmware image supplied by the developer.
+1. Use the magnet gesture to enter DFU mode (see the **Info** tab for the magnet/LED reference).
+2. Use Nordic Semiconductor's **nRF Connect** app with a firmware image from the developer.
 
 ## Development
 
-Voleo is intended for developers and operators working with Juxta 5.8+ devices. The Terminal tab provides full BLE-level visibility for debugging, and the Info tab surfaces the build number (`CFBundleShortVersionString` + `CFBundleVersion`) for support reports.
+- Primary UI and BLE logic live in `Juxta-Voleo-iOS/ContentView.swift`.
+- Protocol reference: [`spec_HUBLINK.md`](spec_HUBLINK.md).
+- The **Terminal** tab provides BLE-level visibility; the **Info** tab shows `CFBundleShortVersionString` + `CFBundleVersion` for support reports.
 
 ## License
 

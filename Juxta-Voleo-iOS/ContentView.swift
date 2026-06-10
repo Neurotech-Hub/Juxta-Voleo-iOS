@@ -1941,10 +1941,16 @@ struct PackagesView: View {
 }
 
 // MARK: - Daily Package View
+/// Atomic payload for `.sheet(item:)` — using a `@State Bool` + separate `[Any]` was
+/// causing the first share tap to present with stale (empty) items.
+private struct SharePayload: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+}
+
 struct DailyPackageView: View {
     let package: DailyPackage
-    @State private var showShareSheet = false
-    @State private var shareItems: [Any] = []
+    @State private var sharePayload: SharePayload?
     @State private var vitalsContent: String? = nil
     @State private var settingsContent: String? = nil
     @State private var bleContent: String? = nil
@@ -1973,8 +1979,8 @@ struct DailyPackageView: View {
                 }
             }
         }
-        .sheet(isPresented: $showShareSheet) {
-            ShareSheet(items: shareItems) { showShareSheet = false }
+        .sheet(item: $sharePayload) { payload in
+            ShareSheet(items: payload.urls.map { $0 as Any }) { sharePayload = nil }
         }
         .onAppear { loadFiles() }
     }
@@ -2067,9 +2073,9 @@ struct DailyPackageView: View {
     }
 
     private func share() {
-        shareItems = package.files.values.map { $0 as Any }
-        guard !shareItems.isEmpty else { return }
-        showShareSheet = true
+        let urls = Array(package.files.values)
+        guard !urls.isEmpty else { return }
+        sharePayload = SharePayload(urls: urls)
     }
 }
 
@@ -2502,11 +2508,26 @@ private struct MagnetGestureRow: Identifiable {
             gesture: "Magnet held during production (not connected)",
             ledFeedback: "5× blink → LED off",
             effect: "5 s debounce then shelf mode"
+        ),
+        MagnetGestureRow(
+            gesture: "NOR or accelerometer init failure",
+            ledFeedback: "Long blink (1 s / 1 s)",
+            effect: "Fault loop; no production operation"
         )
     ]
 }
 
 struct InfoAboutView: View {
+    private static let quickStartSteps: [String] = [
+        "Devices default to shelf mode: ultra-low power, awaiting a magnet.",
+        "Swipe a magnet to wake the device; it enters advertise-to-connect mode with a regular blink.",
+        "In Voleo, scan for the device and connect.",
+        "Time sync runs in the background; settings from the device populate the app. Tap Push if you change any settings.",
+        "On disconnect, the device blinks five times, then enters production mode (main on-device functionality).",
+        "To return to shelf mode during production, swipe the magnet: a series of blinks indicates reset, then one blink confirms reboot into shelf mode.",
+        "Do not hold the magnet longer than 1 s except to enter firmware upgrade (DFU) mode — see Magnet gestures below."
+    ]
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
@@ -2519,35 +2540,28 @@ struct InfoAboutView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("App version")
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Quick start")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("For support, include this build when reporting an issue.")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                    Text("\(AppVersionInfo.marketing) (\(AppVersionInfo.build))")
-                        .font(.system(size: 15, weight: .medium, design: .monospaced))
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(.systemGray6))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Firmware update (DFU)")
-                        .font(.system(size: 13, weight: .semibold))
-                    (Text("DFU mode is entered using the magnet gestures on the device (see below). Once in DFU, use Nordic Semiconductor's ")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                     + Text("nRF Connect")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.secondary)
-                     + Text(" app to flash firmware. Firmware image files are supplied by the developer.")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary))
-                    .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(Array(Self.quickStartSteps.enumerated()), id: \.offset) { index, step in
+                            HStack(alignment: .top, spacing: 10) {
+                                Text("\(index + 1).")
+                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 22, alignment: .trailing)
+                                Text(step)
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.primary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(.systemGray6))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
@@ -2590,6 +2604,37 @@ struct InfoAboutView: View {
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(Color(.separator), lineWidth: 0.5)
                     )
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("App version")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("For support, include this build when reporting an issue.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                    Text("\(AppVersionInfo.marketing) (\(AppVersionInfo.build))")
+                        .font(.system(size: 15, weight: .medium, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(.systemGray6))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Firmware update (DFU)")
+                        .font(.system(size: 13, weight: .semibold))
+                    (Text("DFU mode is entered using the magnet gestures above. Once in DFU, use Nordic Semiconductor's ")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                     + Text("nRF Connect")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.secondary)
+                     + Text(" app to flash firmware. Firmware image files are supplied by the developer.")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary))
+                    .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Text("Developed by the Neurotech Hub at WashU in St. Louis")
