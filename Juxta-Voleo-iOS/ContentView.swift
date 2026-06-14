@@ -2475,24 +2475,29 @@ private struct MagnetGestureRow: Identifiable {
             effect: "Wakes device from System OFF → cold boot"
         ),
         MagnetGestureRow(
-            gesture: "Release < 7 s after cold boot",
-            ledFeedback: "LED off → slow blink (50/450 ms)",
-            effect: "Gateway advertising mode; waits for datetime sync"
+            gesture: "Release < 3 s after cold boot",
+            ledFeedback: "LED off on release",
+            effect: "False positive — re-arms shelf; no datetime sync or DFU; no JXS write"
         ),
         MagnetGestureRow(
-            gesture: "Hold ≥ 7 s after cold boot",
-            ledFeedback: "3× blink → fast blink (50/50 ms)",
-            effect: "DFU mode; 5 s debounce then magnet swipe returns to shelf"
+            gesture: "Release 3 s ≤ t < 10 s after cold boot",
+            ledFeedback: "LED off at 3 s → slow blink (50/450 ms)",
+            effect: "Connectable advertising; waits for time sync. JXS shelf_exit, user_connected, time_set deferred until sync"
+        ),
+        MagnetGestureRow(
+            gesture: "Hold ≥ 10 s after cold boot",
+            ledFeedback: "LED off at 3 s → 3× blink → fast blink (50/50 ms)",
+            effect: "DFU mode; confirmed 3 s hold returns to shelf after 5 s debounce"
         ),
         MagnetGestureRow(
             gesture: "Any connect event",
             ledFeedback: "Solid ON",
-            effect: "Active BLE connection"
+            effect: "Active BLE connection (user_connected in JXS once clock is valid)"
         ),
         MagnetGestureRow(
             gesture: "Disconnect after valid timestamp",
             ledFeedback: "5× blink → LED off",
-            effect: "Production init begins"
+            effect: "Production begins (LED off). JXS user_disconnected then boot"
         ),
         MagnetGestureRow(
             gesture: "Disconnect without timestamp",
@@ -2500,14 +2505,24 @@ private struct MagnetGestureRow: Identifiable {
             effect: "Restarts connectable advertising"
         ),
         MagnetGestureRow(
-            gesture: "Magnet swipe during DFU fast-blink",
+            gesture: "Brief magnet during DFU fast-blink (< 3 s)",
+            ledFeedback: "None",
+            effect: "False positive — stays in DFU"
+        ),
+        MagnetGestureRow(
+            gesture: "Confirmed magnet hold ≥ 3 s during DFU",
             ledFeedback: "LED off",
             effect: "Returns device to shelf mode"
         ),
         MagnetGestureRow(
-            gesture: "Magnet held during production (not connected)",
-            ledFeedback: "5× blink → LED off",
-            effect: "5 s debounce then shelf mode"
+            gesture: "Brief magnet during production (< 3 s)",
+            ledFeedback: "LED ON on apply → off on release",
+            effect: "False positive — production continues"
+        ),
+        MagnetGestureRow(
+            gesture: "Confirmed magnet ≥ 3 s during production",
+            ledFeedback: "LED ON → off at 3 s → 5× blink",
+            effect: "Release after commit cue; 5 s debounce then shelf mode; appends shelf_entry to JXS"
         ),
         MagnetGestureRow(
             gesture: "NOR or accelerometer init failure",
@@ -2519,13 +2534,13 @@ private struct MagnetGestureRow: Identifiable {
 
 struct InfoAboutView: View {
     private static let quickStartSteps: [String] = [
-        "Devices default to shelf mode: ultra-low power, awaiting a magnet.",
-        "Swipe a magnet to wake the device; it enters advertise-to-connect mode with a regular blink.",
-        "In Voleo, scan for the device and connect.",
-        "Time sync runs in the background; settings from the device populate the app. Tap Push if you change any settings.",
-        "On disconnect, the device blinks five times, then enters production mode (main on-device functionality).",
-        "To return to shelf mode during production, swipe the magnet: a series of blinks indicates reset, then one blink confirms reboot into shelf mode.",
-        "Do not hold the magnet longer than 1 s except to enter firmware upgrade (DFU) mode — see Magnet gestures below."
+        "Shelf mode is the default: ultra-low-power System OFF — no LED, no radio. A magnet is the only way to wake.",
+        "Hold a magnet ~3 s to wake: LED solid ON on apply, off at 3 s as a \"release now\" cue, then slow blink (50 ms on / 450 ms off). Holds under 3 s are rejected as false positives.",
+        "In Voleo, scan and connect. The LED stays solid ON for the duration of the BLE connection.",
+        "Time sync runs automatically; device settings populate the app. Tap Push to send any changes back.",
+        "Disconnect to enter production: 5× blink, LED off, then vitals/logging run with LED off throughout.",
+        "Return to shelf during production with a ~3 s magnet hold: solid ON → off at 3 s → 5× blink → grace period → one confirmation blink → System OFF. A shelf_entry row is written to JXS.",
+        "Hold ≥ 10 s only to enter DFU: LED off at 3 s, then 3× blink and fast blink at 10 s. Release between 3 s and 10 s if you only want to wake, not update firmware."
     ]
 
     var body: some View {
@@ -2543,6 +2558,10 @@ struct InfoAboutView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Quick start")
                         .font(.system(size: 13, weight: .semibold))
+                    Text("End-to-end flow in Voleo. Magnet timing is enforced by firmware (3 s minimum hold, 10 s for DFU) — see Magnet gestures below.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(Array(Self.quickStartSteps.enumerated()), id: \.offset) { index, step in
                             HStack(alignment: .top, spacing: 10) {
@@ -2567,7 +2586,7 @@ struct InfoAboutView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Magnet gestures & LED feedback")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("These gestures apply to the physical device. LED patterns indicate mode and timing.")
+                    Text("Every magnet gesture requires a confirmed 3 s minimum hold; shorter touches are false positives. At 3 s the LED turns off as a \"release now\" commit cue on wake and production paths. DFU requires a 10 s hold.")
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2625,7 +2644,7 @@ struct InfoAboutView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Firmware update (DFU)")
                         .font(.system(size: 13, weight: .semibold))
-                    (Text("DFU mode is entered using the magnet gestures above. Once in DFU, use Nordic Semiconductor's ")
+                    (Text("DFU mode is entered with a ≥ 10 s magnet hold (see gestures above). Once in DFU, use Nordic Semiconductor's ")
                         .font(.system(size: 13))
                         .foregroundColor(.secondary)
                      + Text("nRF Connect")
