@@ -94,7 +94,59 @@ class PackageStore: ObservableObject {
 
     enum StoreError: Error { case noDocumentsDirectory }
 
-    init() { refresh() }
+    private static let archivedKeysDefaultsKey = "archivedPackageKeys"
+    @Published private(set) var archivedKeys: Set<String>
+
+    init() {
+        archivedKeys = Set(UserDefaults.standard.stringArray(forKey: Self.archivedKeysDefaultsKey) ?? [])
+        refresh()
+    }
+
+    static func packageKey(deviceID: String, dateKey: String) -> String {
+        "\(deviceID)|\(dateKey)"
+    }
+
+    private func packageKey(for package: DailyPackage) -> String {
+        Self.packageKey(deviceID: package.deviceID, dateKey: package.dateKey)
+    }
+
+    private func persistArchivedKeys() {
+        UserDefaults.standard.set(Array(archivedKeys), forKey: Self.archivedKeysDefaultsKey)
+    }
+
+    func isArchived(_ package: DailyPackage) -> Bool {
+        archivedKeys.contains(packageKey(for: package))
+    }
+
+    func archive(_ package: DailyPackage) {
+        archivedKeys.insert(packageKey(for: package))
+        persistArchivedKeys()
+    }
+
+    func archiveAll() {
+        for pkg in packages {
+            archivedKeys.insert(packageKey(for: pkg))
+        }
+        persistArchivedKeys()
+    }
+
+    func unarchive(_ package: DailyPackage) {
+        archivedKeys.remove(packageKey(for: package))
+        persistArchivedKeys()
+    }
+
+    private func clearArchiveState(deviceID: String, dateKey: String) {
+        archivedKeys.remove(Self.packageKey(deviceID: deviceID, dateKey: dateKey))
+        persistArchivedKeys()
+    }
+
+    private func pruneStaleArchivedKeys(against packages: [DailyPackage]) {
+        let liveKeys = Set(packages.map { packageKey(for: $0) })
+        let pruned = archivedKeys.intersection(liveKeys)
+        guard pruned.count != archivedKeys.count else { return }
+        archivedKeys = pruned
+        persistArchivedKeys()
+    }
 
     func refresh() {
         DispatchQueue.global(qos: .utility).async {
@@ -134,7 +186,10 @@ class PackageStore: ObservableObject {
                 return $0.deviceID > $1.deviceID
             }
 
-            DispatchQueue.main.async { self.packages = result }
+            DispatchQueue.main.async {
+                self.packages = result
+                self.pruneStaleArchivedKeys(against: result)
+            }
         }
     }
 
@@ -148,12 +203,16 @@ class PackageStore: ObservableObject {
         try fm.createDirectory(at: deviceDir, withIntermediateDirectories: true)
         let fileURL = deviceDir.appendingPathComponent(filename)
         try content.write(to: fileURL, atomically: true, encoding: .utf8)
+        if let dateKey = Self.dateKey(from: filename) {
+            clearArchiveState(deviceID: deviceID, dateKey: dateKey)
+        }
         return fileURL
     }
 
     func delete(_ package: DailyPackage) {
         let fm = FileManager.default
         for (_, url) in package.files { try? fm.removeItem(at: url) }
+        clearArchiveState(deviceID: package.deviceID, dateKey: package.dateKey)
         refresh()
     }
 
@@ -1820,6 +1879,11 @@ struct ContentView: View {
 }
 
 // MARK: - Packages View
+private enum PackageFilter: String, CaseIterable {
+    case active = "Active"
+    case archived = "Archived"
+}
+
 private struct DevicePackageGroup: Identifiable {
     let id: String
     let deviceID: String
@@ -1829,12 +1893,25 @@ private struct DevicePackageGroup: Identifiable {
 
 struct PackagesView: View {
     @EnvironmentObject var packageStore: PackageStore
+    @State private var packageFilter: PackageFilter = .active
     @State private var showDeleteConfirm = false
+    @State private var showArchiveAllConfirm = false
     @State private var packageToDelete: DailyPackage?
+
+    private var filteredPackages: [DailyPackage] {
+        packageStore.packages.filter { pkg in
+            let archived = packageStore.isArchived(pkg)
+            return packageFilter == .archived ? archived : !archived
+        }
+    }
+
+    private var activePackageCount: Int {
+        packageStore.packages.filter { !packageStore.isArchived($0) }.count
+    }
 
     /// Devices ordered by most recently written local package (`lastFileWriteAt`); `dateKey` alone is day-only.
     private var devicePackageGroups: [DevicePackageGroup] {
-        let byDevice = Dictionary(grouping: packageStore.packages, by: { $0.deviceID })
+        let byDevice = Dictionary(grouping: filteredPackages, by: { $0.deviceID })
         return byDevice
             .map { deviceID, pkgs -> DevicePackageGroup in
                 let sorted = pkgs.sorted {
@@ -1857,18 +1934,17 @@ struct PackagesView: View {
     var body: some View {
         Group {
             if packageStore.packages.isEmpty {
-                VStack(spacing: 16) {
-                    Spacer()
-                    Image(systemName: "folder.badge.questionmark")
-                        .font(.system(size: 48))
-                        .foregroundColor(.secondary)
-                    Text("No packages yet.")
-                        .font(.system(size: 18, weight: .semibold))
-                    Text("Transfer data from a connected device.")
-                        .font(.system(size: 14))
-                        .foregroundColor(.secondary)
-                    Spacer()
-                }
+                emptyPackagesView(
+                    title: "No packages yet.",
+                    subtitle: "Transfer data from a connected device."
+                )
+            } else if filteredPackages.isEmpty {
+                emptyPackagesView(
+                    title: packageFilter == .active ? "No active packages." : "No archived packages.",
+                    subtitle: packageFilter == .active
+                        ? "Check Archived or transfer new data from a device."
+                        : "Archive packages from the Active tab to see them here."
+                )
             } else {
                 List {
                     ForEach(devicePackageGroups) { group in
@@ -1895,11 +1971,26 @@ struct PackagesView: View {
                                     .contentShape(Rectangle())
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button(role: .destructive) {
-                                        packageToDelete = pkg
-                                        showDeleteConfirm = true
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
+                                    if packageFilter == .active {
+                                        Button {
+                                            packageStore.archive(pkg)
+                                        } label: {
+                                            Label("Archive", systemImage: "archivebox")
+                                        }
+                                        .tint(.orange)
+                                    } else {
+                                        Button {
+                                            packageStore.unarchive(pkg)
+                                        } label: {
+                                            Label("Unarchive", systemImage: "tray.and.arrow.up")
+                                        }
+                                        .tint(.blue)
+                                        Button(role: .destructive) {
+                                            packageToDelete = pkg
+                                            showDeleteConfirm = true
+                                        } label: {
+                                            Label("Delete", systemImage: "trash")
+                                        }
                                     }
                                 }
                                 .listRowInsets(EdgeInsets(top: 3, leading: 16, bottom: 3, trailing: 8))
@@ -1917,9 +2008,21 @@ struct PackagesView: View {
         }
         .navigationTitle("Packages")
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("Filter", selection: $packageFilter) {
+                    ForEach(PackageFilter.allCases, id: \.self) { filter in
+                        Text(filter.rawValue).tag(filter)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 260)
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button(action: { packageStore.refresh() }) {
-                    Image(systemName: "arrow.clockwise")
+                if packageFilter == .active, activePackageCount > 0 {
+                    Button("Archive All") {
+                        showArchiveAllConfirm = true
+                    }
+                    .font(.system(size: 15))
                 }
             }
         }
@@ -1930,6 +2033,31 @@ struct PackagesView: View {
             }
         } message: {
             Text("This will permanently delete all files in this package from the device. This cannot be undone.")
+        }
+        .alert("Archive All Packages", isPresented: $showArchiveAllConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Archive All") {
+                packageStore.archiveAll()
+            }
+        } message: {
+            Text("Archive all \(activePackageCount) package\(activePackageCount == 1 ? "" : "s")? They will move to the Archived tab. Files are not deleted.")
+        }
+    }
+
+    private func emptyPackagesView(title: String, subtitle: String) -> some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image(systemName: "folder.badge.questionmark")
+                .font(.system(size: 48))
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.system(size: 18, weight: .semibold))
+            Text(subtitle)
+                .font(.system(size: 14))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            Spacer()
         }
     }
 
