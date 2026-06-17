@@ -276,6 +276,8 @@ class AppState: ObservableObject {
         hasFullNodeDeviceSettings = false
         isBaseStationConnection = false
         didLogBaseStationNotice = false
+        showClearMemoryAlert = false
+        showShelfModeAlert = false
     }
 
     /// Device Settings UI requires these camelCase keys (with matching types) in the node characteristic JSON.
@@ -1516,28 +1518,30 @@ struct ContentView: View {
 
             dailyPackagesCard
 
-            HStack(spacing: 12) {
-                Button(action: {
-                    appState.showShelfModeAlert = true
-                }) {
-                    Text("Shelf Mode")
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 36)
-                }
-                .buttonStyle(JuxtaButtonStyle(color: .orange))
+            if appState.hasFullNodeDeviceSettings {
+                HStack(spacing: 12) {
+                    Button(action: {
+                        appState.showShelfModeAlert = true
+                    }) {
+                        Text("Shelf Mode")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                    }
+                    .buttonStyle(JuxtaButtonStyle(color: .orange))
 
-                Button(action: {
-                    appState.showClearMemoryAlert = true
-                }) {
-                    Text("Clear Memory")
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 36)
+                    Button(action: {
+                        appState.showClearMemoryAlert = true
+                    }) {
+                        Text("Clear Memory")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                    }
+                    .buttonStyle(JuxtaButtonStyle(color: .orange))
                 }
-                .buttonStyle(JuxtaButtonStyle(color: .orange))
             }
         }
         .padding()
