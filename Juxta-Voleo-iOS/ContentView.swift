@@ -2083,19 +2083,21 @@ private struct SharePayload: Identifiable {
 struct DailyPackageView: View {
     let package: DailyPackage
     @State private var sharePayload: SharePayload?
-    @State private var vitalsContent: String? = nil
-    @State private var settingsContent: String? = nil
-    @State private var bleContent: String? = nil
+    @State private var vitalsSummary: PackageFileSummary?
+    @State private var settingsSummary: PackageFileSummary?
+    @State private var bleSummary: PackageFileSummary?
+    @State private var isCopying = false
+    @State private var copyFeedback = ""
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 fileSection(title: "Vitals", filename: "JXV\(package.dateKey).csv",
-                            url: package.vitalsURL, content: vitalsContent, action: .plots(.vitals))
+                            url: package.vitalsURL, summary: vitalsSummary, action: .plots(.vitals))
                 fileSection(title: "Settings", filename: "JXS\(package.dateKey).csv",
-                            url: package.settingsURL, content: settingsContent, action: .table)
+                            url: package.settingsURL, summary: settingsSummary, action: .table)
                 fileSection(title: "BLE Activity", filename: "JXB\(package.dateKey).csv",
-                            url: package.bleURL, content: bleContent, action: .plots(.ble))
+                            url: package.bleURL, summary: bleSummary, action: .plots(.ble))
             }
             .padding()
         }
@@ -2104,32 +2106,42 @@ struct DailyPackageView: View {
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button(action: copyAll) {
-                    Label("Copy", systemImage: "doc.on.doc")
+                    if isCopying {
+                        ProgressView()
+                    } else {
+                        Label(copyFeedback.isEmpty ? "Copy" : copyFeedback, systemImage: copyFeedback.isEmpty ? "doc.on.doc" : "checkmark")
+                    }
                 }
+                .disabled(isCopying || !hasAnyFile)
                 Button(action: share) {
                     Label("Share", systemImage: "square.and.arrow.up")
                 }
+                .disabled(!hasAnyFile)
             }
         }
         .sheet(item: $sharePayload) { payload in
             ShareSheet(items: payload.urls.map { $0 as Any }) { sharePayload = nil }
         }
-        .onAppear { loadFiles() }
+        .task { await loadSummaries() }
     }
 
-    private func fileSection(title: String, filename: String, url: URL?, content: String?, action: SectionAction?) -> some View {
+    private var hasAnyFile: Bool {
+        package.vitalsURL != nil || package.settingsURL != nil || package.bleURL != nil
+    }
+
+    private func fileSection(title: String, filename: String, url: URL?, summary: PackageFileSummary?, action: SectionAction?) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label(title, systemImage: fileIcon(for: title))
                     .font(.system(size: 16, weight: .semibold))
                 Spacer()
-                if url != nil, let text = content, let action = action {
+                if let url, summary != nil, let action {
                     NavigationLink {
                         switch action {
                         case .plots(let kind):
-                            PlotsView(csvText: text, kind: kind, displayDate: package.displayDate)
+                            PlotsView(fileURL: url, kind: kind, displayDate: package.displayDate)
                         case .table:
-                            CSVFullTextView(csvText: text, filename: filename, displayDate: package.displayDate)
+                            CSVFullTextView(fileURL: url, filename: filename, displayDate: package.displayDate)
                         }
                     } label: {
                         HStack(spacing: 4) {
@@ -2141,19 +2153,18 @@ struct DailyPackageView: View {
                     }
                 }
             }
-            if let url = url {
-                if let text = content {
+            if let url {
+                if let summary {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        Text(text.isEmpty ? "(empty)" : text)
+                        Text(summary.previewText.isEmpty ? "(empty)" : summary.previewText)
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundColor(.primary)
-                            .textSelection(.enabled)
                             .padding(10)
                     }
                     .frame(maxHeight: 200)
                     .background(Color(.systemGray6))
                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                    Text("\(url.lastPathComponent) — \(text.components(separatedBy: "\n").count) lines")
+                    Text(fileSubtitle(filename: url.lastPathComponent, summary: summary))
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                 } else {
@@ -2174,6 +2185,14 @@ struct DailyPackageView: View {
         }
     }
 
+    private func fileSubtitle(filename: String, summary: PackageFileSummary) -> String {
+        var parts = ["\(filename) — \(formatLineCount(summary.lineCount)) lines", formatByteCount(summary.byteCount)]
+        if summary.isTruncated {
+            parts.append("preview")
+        }
+        return parts.joined(separator: " · ")
+    }
+
     private func fileIcon(for title: String) -> String {
         switch title {
         case "Vitals":      return "heart.text.square"
@@ -2183,25 +2202,62 @@ struct DailyPackageView: View {
         }
     }
 
-    private func loadFiles() {
-        Task { @MainActor in
-            vitalsContent = package.vitalsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(stripUTF8BOMPrefix(from:)) ?? ""
-            settingsContent = package.settingsURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(stripUTF8BOMPrefix(from:)) ?? ""
-            bleContent = package.bleURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.map(stripUTF8BOMPrefix(from:)) ?? ""
-        }
+    private func loadSummaries() async {
+        async let vitals = loadSummary(for: package.vitalsURL)
+        async let settings = loadSummary(for: package.settingsURL)
+        async let ble = loadSummary(for: package.bleURL)
+        let loaded = await (vitals, settings, ble)
+        vitalsSummary = loaded.0
+        settingsSummary = loaded.1
+        bleSummary = loaded.2
+    }
+
+    private func loadSummary(for url: URL?) async -> PackageFileSummary? {
+        guard let url else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            loadPackageFileSummary(at: url)
+        }.value
     }
 
     private func copyAll() {
-        let vitalsName   = package.vitalsURL?.lastPathComponent   ?? "JXV\(package.dateKey).csv"
-        let settingsName = package.settingsURL?.lastPathComponent ?? "JXS\(package.dateKey).csv"
-        let bleName      = package.bleURL?.lastPathComponent      ?? "JXB\(package.dateKey).csv"
+        guard !isCopying else { return }
+        isCopying = true
+        copyFeedback = ""
+        let vitalsURL = package.vitalsURL
+        let settingsURL = package.settingsURL
+        let bleURL = package.bleURL
+        let vitalsName = vitalsURL?.lastPathComponent ?? "JXV\(package.dateKey).csv"
+        let settingsName = settingsURL?.lastPathComponent ?? "JXS\(package.dateKey).csv"
+        let bleName = bleURL?.lastPathComponent ?? "JXB\(package.dateKey).csv"
 
-        let parts = [
-            vitalsContent.map   { "=== Vitals — \(vitalsName) ===\n\($0)" },
-            settingsContent.map { "=== Settings — \(settingsName) ===\n\($0)" },
-            bleContent.map      { "=== BLE Activity — \(bleName) ===\n\($0)" }
-        ].compactMap { $0 }
-        UIPasteboard.general.string = parts.joined(separator: "\n\n")
+        Task {
+            let combined = await Task.detached(priority: .userInitiated) {
+                var parts: [String] = []
+                if let url = vitalsURL, let text = readFullFileText(at: url) {
+                    parts.append("=== Vitals — \(vitalsName) ===\n\(text)")
+                }
+                if let url = settingsURL, let text = readFullFileText(at: url) {
+                    parts.append("=== Settings — \(settingsName) ===\n\(text)")
+                }
+                if let url = bleURL, let text = readFullFileText(at: url) {
+                    parts.append("=== BLE Activity — \(bleName) ===\n\(text)")
+                }
+                return parts.joined(separator: "\n\n")
+            }.value
+
+            await MainActor.run {
+                if combined.isEmpty {
+                    copyFeedback = "Empty"
+                } else {
+                    UIPasteboard.general.string = combined
+                    copyFeedback = "Copied"
+                }
+                isCopying = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                    copyFeedback = ""
+                }
+            }
+        }
     }
 
     private func share() {
@@ -2307,6 +2363,7 @@ private func parseCsvInt(_ raw: String?) -> Int? {
 }
 
 private func parseCSV(_ text: String) -> [[String: String]] {
+    // Prefer streaming file parsers for production loads; kept for small in-memory paths only.
     let normalized = normalizeCsvLineEndings(stripUTF8BOMPrefix(from: text))
     let lines = normalized
         .components(separatedBy: "\n")
@@ -2331,25 +2388,257 @@ private func parseCSV(_ text: String) -> [[String: String]] {
     return rows
 }
 
+// MARK: - Package CSV file helpers (streaming / bounded memory)
+
+private enum PackageCSVConstants {
+    static let previewLineCount = 40
+    static let bleChartMaxPoints = 3_000
+    static let largeFileThreshold = 1_048_576
+}
+
+private struct PackageFileSummary {
+    var previewText: String
+    var lineCount: Int
+    var byteCount: Int
+    var isTruncated: Bool
+}
+
+private struct CsvColumnMap {
+    let headers: [String]
+
+    func index(of name: String) -> Int? {
+        headers.firstIndex(of: name.lowercased())
+    }
+}
+
+private struct BLEParseResult {
+    let rows: [BLERow]
+    let totalEventCount: Int
+}
+
+private func fileByteCount(at url: URL) -> Int {
+    (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+}
+
+private func csvColumns(from line: String) -> [String] {
+    line.split(separator: ",", omittingEmptySubsequences: false).map(trimCsvCell)
+}
+
+private func parseCsvHeaderMap(from line: String) -> CsvColumnMap? {
+    let headers = csvColumns(from: line).map { $0.lowercased() }
+    guard !headers.isEmpty else { return nil }
+    return CsvColumnMap(headers: headers)
+}
+
+private func forEachCsvLine(in url: URL, _ body: (String) -> Bool) {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+    defer { try? handle.close() }
+
+    var lineBuffer = ""
+    var bomHandled = false
+
+    func emitLine(_ raw: String) -> Bool {
+        var line = raw
+        if !bomHandled {
+            line = stripUTF8BOMPrefix(from: line)
+            bomHandled = true
+        }
+        return body(line)
+    }
+
+    while true {
+        let chunk = handle.readData(ofLength: 65_536)
+        if chunk.isEmpty { break }
+        guard var chunkStr = String(data: chunk, encoding: .utf8) else { continue }
+        chunkStr = normalizeCsvLineEndings(chunkStr)
+        lineBuffer += chunkStr
+        while let range = lineBuffer.range(of: "\n") {
+            let line = String(lineBuffer[..<range.lowerBound])
+            lineBuffer = String(lineBuffer[range.upperBound...])
+            if !emitLine(line) { return }
+        }
+    }
+    if !lineBuffer.isEmpty {
+        _ = emitLine(lineBuffer)
+    }
+}
+
+private func loadPackageFileSummary(at url: URL, maxPreviewLines: Int = PackageCSVConstants.previewLineCount) -> PackageFileSummary? {
+    let byteCount = fileByteCount(at: url)
+    var previewLines: [String] = []
+    previewLines.reserveCapacity(maxPreviewLines)
+    var lineCount = 0
+    var hasMoreAfterPreview = false
+
+    forEachCsvLine(in: url) { line in
+        lineCount += 1
+        if previewLines.count < maxPreviewLines {
+            previewLines.append(line)
+        } else {
+            hasMoreAfterPreview = true
+        }
+        return true
+    }
+
+    let truncated = hasMoreAfterPreview || lineCount > previewLines.count
+    return PackageFileSummary(
+        previewText: previewLines.joined(separator: "\n"),
+        lineCount: lineCount,
+        byteCount: byteCount,
+        isTruncated: truncated
+    )
+}
+
+private func readFullFileText(at url: URL) -> String? {
+    guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+          let text = String(data: data, encoding: .utf8) else { return nil }
+    return stripUTF8BOMPrefix(from: normalizeCsvLineEndings(text))
+}
+
+private func vitalsRow(from cols: [String], map: CsvColumnMap, id: Int) -> VitalsRow? {
+    guard let unixIdx = map.index(of: "unix"), unixIdx < cols.count,
+          let unix = parseCsvUnixSeconds(cols[unixIdx]) else { return nil }
+    func col(_ name: String) -> String? {
+        guard let idx = map.index(of: name), idx < cols.count else { return nil }
+        return cols[idx]
+    }
+    return VitalsRow(
+        id: id,
+        date: Date(timeIntervalSince1970: unix),
+        battV: parseCsvDouble(col("batt_v")),
+        tempC: parseCsvDouble(col("temp_c")),
+        lux: parseCsvDouble(col("lux")),
+        motion: parseCsvDouble(col("motion"))
+    )
+}
+
+private func bleRow(from cols: [String], map: CsvColumnMap, id: Int) -> BLERow? {
+    guard let unixIdx = map.index(of: "unix"), unixIdx < cols.count,
+          let unix = parseCsvUnixSeconds(cols[unixIdx]) else { return nil }
+    let peerIdx = map.index(of: "peer_id") ?? map.index(of: "observer_id")
+    guard let pIdx = peerIdx, pIdx < cols.count else { return nil }
+    let peer = cols[pIdx].trimmingCharacters(in: .csvCellTrimming)
+    guard !peer.isEmpty else { return nil }
+    guard let rssiIdx = map.index(of: "rssi"), rssiIdx < cols.count,
+          let rssi = parseCsvInt(cols[rssiIdx]) else { return nil }
+    return BLERow(id: id, date: Date(timeIntervalSince1970: unix), peerID: peer, rssi: rssi)
+}
+
+private func parseVitalsRows(from url: URL) -> [VitalsRow] {
+    var headerMap: CsvColumnMap?
+    var rows: [VitalsRow] = []
+
+    forEachCsvLine(in: url) { line in
+        let trimmed = line.trimmingCharacters(in: .csvCellTrimming)
+        guard !trimmed.isEmpty else { return true }
+        if headerMap == nil {
+            headerMap = parseCsvHeaderMap(from: trimmed)
+            return true
+        }
+        guard let map = headerMap else { return true }
+        let cols = csvColumns(from: trimmed)
+        if let row = vitalsRow(from: cols, map: map, id: rows.count) {
+            rows.append(row)
+        }
+        return true
+    }
+    return rows
+}
+
+private func parseBLERows(from url: URL, maxPoints: Int) -> BLEParseResult {
+    var headerMap: CsvColumnMap?
+    var total = 0
+
+    forEachCsvLine(in: url) { line in
+        let trimmed = line.trimmingCharacters(in: .csvCellTrimming)
+        guard !trimmed.isEmpty else { return true }
+        if headerMap == nil {
+            headerMap = parseCsvHeaderMap(from: trimmed)
+            return true
+        }
+        guard let map = headerMap else { return true }
+        if bleRow(from: csvColumns(from: trimmed), map: map, id: 0) != nil {
+            total += 1
+        }
+        return true
+    }
+
+    guard total > 0, let map = headerMap else {
+        return BLEParseResult(rows: [], totalEventCount: 0)
+    }
+
+    let cap = max(1, maxPoints)
+    let stride = max(1, total / cap)
+    var rows: [BLERow] = []
+    rows.reserveCapacity(min(total, cap))
+    var dataIndex = 0
+    var rowId = 0
+    var headerSeen = false
+
+    forEachCsvLine(in: url) { line in
+        let trimmed = line.trimmingCharacters(in: .csvCellTrimming)
+        guard !trimmed.isEmpty else { return true }
+        if !headerSeen {
+            headerSeen = true
+            return true
+        }
+        let cols = csvColumns(from: trimmed)
+        guard bleRow(from: cols, map: map, id: 0) != nil else { return true }
+        if dataIndex % stride == 0 {
+            if let row = bleRow(from: cols, map: map, id: rowId) {
+                rows.append(row)
+                rowId += 1
+            }
+            if rows.count >= cap { return false }
+        }
+        dataIndex += 1
+        return true
+    }
+
+    return BLEParseResult(rows: rows, totalEventCount: total)
+}
+
+private func formatLineCount(_ count: Int) -> String {
+    count.formatted()
+}
+
+private func formatByteCount(_ bytes: Int) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+}
+
 // MARK: - Plots View
 struct PlotsView: View {
-    /// In-memory CSV from `DailyPackageView` (no second file read; avoids errno 2 from background fopen).
-    let csvText: String
+    let fileURL: URL
     let kind: PlotKind
     let displayDate: String
 
     @State private var vitalsRows: [VitalsRow] = []
     @State private var bleRows: [BLERow] = []
+    @State private var bleTotalEvents = 0
     @State private var errorText: String? = nil
+    @State private var isLoading = true
+
+    private var isLargeFile: Bool {
+        fileByteCount(at: fileURL) >= PackageCSVConstants.largeFileThreshold
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                if let err = errorText {
+                if isLoading {
+                    ProgressView("Loading plots…")
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                } else if let err = errorText {
                     Text(err)
                         .foregroundColor(.red)
                         .padding()
                 } else {
+                    if isLargeFile {
+                        Text("Large file — charts use streaming parse.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
                     switch kind {
                     case .vitals:
                         if vitalsRows.isEmpty { emptyState } else { vitalsCharts }
@@ -2448,6 +2737,12 @@ struct PlotsView: View {
                 }
             }
         }
+        if bleTotalEvents > bleRows.count {
+            Text("Showing \(formatLineCount(bleRows.count)) of \(formatLineCount(bleTotalEvents)) events")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
         VStack(alignment: .leading, spacing: 6) {
             Text("RSSI legend")
                 .font(.system(size: 11, weight: .semibold))
@@ -2490,48 +2785,27 @@ struct PlotsView: View {
     }
 
     private func parseCsvForCharts() async {
-        let text = csvText
+        let url = fileURL
         let k = kind
-        let rows = await Task.detached(priority: .userInitiated) {
-            parseCSV(text)
-        }.value
-        await MainActor.run {
-            errorText = nil
+        let result: (vitals: [VitalsRow], ble: BLEParseResult?, error: String?) = await Task.detached(priority: .userInitiated) {
             switch k {
             case .vitals:
-                var vs: [VitalsRow] = []
-                vs.reserveCapacity(rows.count)
-                for row in rows {
-                    guard let unix = parseCsvUnixSeconds(row["unix"]) else { continue }
-                    vs.append(
-                        VitalsRow(
-                            id: vs.count,
-                            date: Date(timeIntervalSince1970: unix),
-                            battV: parseCsvDouble(row["batt_v"]),
-                            tempC: parseCsvDouble(row["temp_c"]),
-                            lux: parseCsvDouble(row["lux"]),
-                            motion: parseCsvDouble(row["motion"])
-                        )
-                    )
-                }
-                vitalsRows = vs
+                return (parseVitalsRows(from: url), nil, nil)
             case .ble:
-                var br: [BLERow] = []
-                br.reserveCapacity(rows.count)
-                for row in rows {
-                    guard let unix = parseCsvUnixSeconds(row["unix"]) else { continue }
-                    let peer = (row["peer_id"] ?? row["observer_id"] ?? "").trimmingCharacters(in: .csvCellTrimming)
-                    guard !peer.isEmpty, let rssi = parseCsvInt(row["rssi"]) else { continue }
-                    br.append(
-                        BLERow(
-                            id: br.count,
-                            date: Date(timeIntervalSince1970: unix),
-                            peerID: peer,
-                            rssi: rssi
-                        )
-                    )
-                }
-                bleRows = br
+                let ble = parseBLERows(from: url, maxPoints: PackageCSVConstants.bleChartMaxPoints)
+                return ([], ble, nil)
+            }
+        }.value
+
+        isLoading = false
+        errorText = result.error
+        switch k {
+        case .vitals:
+            vitalsRows = result.vitals
+        case .ble:
+            if let ble = result.ble {
+                bleRows = ble.rows
+                bleTotalEvents = ble.totalEventCount
             }
         }
     }
@@ -2539,40 +2813,90 @@ struct PlotsView: View {
 
 // MARK: - CSV full text (Settings “View All”)
 
+private struct CSVFileTextView: UIViewRepresentable {
+    let text: String
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        textView.backgroundColor = UIColor.systemGray6
+        textView.textContainerInset = UIEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        textView.text = text
+        return textView
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text {
+            uiView.text = text
+        }
+    }
+}
+
 private struct CSVFullTextView: View {
-    /// In-memory CSV from `DailyPackageView` (same string as the package preview).
-    let csvText: String
+    let fileURL: URL
     let filename: String
     let displayDate: String
 
-    private var lineCount: Int {
-        csvText.components(separatedBy: "\n").count
-    }
+    @State private var fileText: String?
+    @State private var lineCount = 0
+    @State private var loadError: String?
+
+    private var byteCount: Int { fileByteCount(at: fileURL) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ScrollView(.vertical, showsIndicators: true) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    Text(csvText.isEmpty ? "(empty)" : csvText)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.primary)
-                        .textSelection(.enabled)
-                        .padding(10)
+            if byteCount >= PackageCSVConstants.largeFileThreshold {
+                Text("Large file (\(formatByteCount(byteCount))) — loaded for viewing.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            Group {
+                if let loadError {
+                    Text(loadError)
+                        .foregroundColor(.red)
+                        .padding()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let fileText {
+                    CSVFileTextView(text: fileText)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ProgressView("Loading file…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.systemGray6))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
-            Text("\(filename) — \(lineCount) lines")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
+            if lineCount > 0 {
+                Text("\(filename) — \(formatLineCount(lineCount)) lines")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(.systemBackground))
         .navigationTitle("\(filename) — \(displayDate)")
         .navigationBarTitleDisplayMode(.inline)
+        .task { await loadFile() }
+    }
+
+    private func loadFile() async {
+        let url = fileURL
+        let summary = await Task.detached(priority: .userInitiated) {
+            (
+                text: readFullFileText(at: url),
+                lines: loadPackageFileSummary(at: url)?.lineCount ?? 0
+            )
+        }.value
+        if let text = summary.text {
+            fileText = text
+            lineCount = summary.lines
+        } else {
+            loadError = "Could not read \(filename)."
+        }
     }
 }
 
